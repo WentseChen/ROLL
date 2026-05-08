@@ -534,6 +534,52 @@ class AgenticPipeline(BasePipeline):
 
                     metrics["time/step_old_log_probs_values"] = cal_old_logpb_timer.last
 
+                    # PHASE 11b: CTDE teacher log-probs
+                    if (
+                        self.pipeline_config.ctde.enabled
+                        and "global_state" in batch.non_tensor_batch
+                    ):
+                        with Timer(name="ctde_teacher_logprobs", logger=None) as ctde_timer:
+                            from roll.pipeline.agentic.ctde_logprob import (
+                                build_privileged_batch,
+                                align_teacher_logprobs,
+                                compute_ctde_reward_bonus,
+                            )
+                            ctde_cfg = self.pipeline_config.ctde
+                            priv_batch = build_privileged_batch(
+                                batch=batch,
+                                global_states=batch.non_tensor_batch["global_state"],
+                                tokenizer=self.tokenizer,
+                                ctde_config=ctde_cfg,
+                                max_seq_len=self.pipeline_config.sequence_length,
+                            )
+                            batch_balance(priv_batch, dp_size=self.actor_train.dp_size, minibatch_size=len(priv_batch))
+                            priv_batch.meta_info["is_offload_states"] = False
+                            teacher_lp_refs: List[ray.ObjectRef] = self.actor_train.compute_log_probs(
+                                priv_batch, blocking=False
+                            )
+                            teacher_lp_data: DataProto = DataProto.materialize_concat(data_refs=teacher_lp_refs)
+                            teacher_log_probs = align_teacher_logprobs(
+                                priv_log_probs=teacher_lp_data.batch["log_probs"],
+                                priv_response_mask=priv_batch.batch["response_mask"],
+                                orig_response_mask=batch.batch["response_mask"],
+                            )
+                            batch.batch["teacher_log_probs"] = teacher_log_probs
+
+                            if ctde_cfg.signal_mode == "reward_bonus":
+                                infer_lp = batch.batch.get("infer_logprobs", batch.batch.get("old_log_probs"))
+                                if infer_lp is not None:
+                                    bonus, log_ratio = compute_ctde_reward_bonus(
+                                        teacher_log_probs=teacher_log_probs,
+                                        infer_log_probs=infer_lp,
+                                        response_mask=batch.batch["response_mask"],
+                                        bonus_weight=ctde_cfg.bonus_weight,
+                                    )
+                                    batch.batch["scores"] = batch.batch["scores"] + bonus
+                                    metrics["ctde/log_ratio_mean"] = log_ratio.mean().item()
+                                    metrics["ctde/log_ratio_std"] = log_ratio.std().item()
+                        metrics["time/step_ctde_teacher_logprobs"] = ctde_timer.last
+
                     # TODO 当前这个还没用处
                     with Timer(name="cal_response_level_mask", logger=None) as timer:
                         # TODO 补充完善的过滤要求，不同环境需要维持统一过滤标识

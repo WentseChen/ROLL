@@ -548,6 +548,11 @@ class KuhnPokerEnv(Env):
             "metrics_agg_mode": base_agg,
             "action_desc": desc,
             "reasoning_bonus": reasoning_bonus,
+            "global_state": {
+                "agent_card": self.cards[0 if self.agent_is_p0 else 1],
+                "opp_card": self.cards[1 if self.agent_is_p0 else 0],
+                "agent_is_p0": self.agent_is_p0,
+            },
         }
 
     def _info_set_indicators(self) -> dict:

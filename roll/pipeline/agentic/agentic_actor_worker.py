@@ -97,6 +97,24 @@ class ActorWorker(BaseActorWorker):
             total_loss = pg_loss + kl_loss * kl_coef
         else:
             total_loss = pg_loss
+
+        ctde_cfg = getattr(self.pipeline_config, "ctde", None)
+        if (
+            ctde_cfg is not None
+            and ctde_cfg.enabled
+            and ctde_cfg.signal_mode == "kl_distill"
+            and "teacher_log_probs" in data.batch
+        ):
+            teacher_lp = data.batch["teacher_log_probs"]
+            kl_distill = agg_loss(
+                loss_mat=(log_probs - teacher_lp),
+                loss_mask=response_mask,
+                loss_agg_mode=self.pipeline_config.loss_agg_mode,
+                batch_num_tokens=batch_num_tokens["response_mask"],
+                global_valid_samples=global_valid_samples["response_mask"],
+            )
+            total_loss = total_loss + ctde_cfg.kl_coef * kl_distill
+            pg_metrics["ctde/kl_distill@sum"] = kl_distill.detach().item()
         entropy = self.strategy.op_compute_entropy(
             logits=output_tensor, attention_mask=data.batch["response_mask"]
         )

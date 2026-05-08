@@ -133,6 +133,30 @@ class RewardNormalizationConfig:
 
 
 @dataclass
+class CTDEConfig:
+    """Centralized Training, Decentralized Execution config.
+
+    Two-pass algorithm: Pass 1 collects trajectories with partial info.
+    Pass 2 re-evaluates the same responses under a privileged prompt that
+    appends opponent card and/or reasoning (global state). The resulting
+    teacher log-probs are used as a training signal via reward bonus or KL loss.
+    """
+    enabled: bool = field(default=False, metadata={"help": "Enable CTDE two-pass training."})
+    use_opponent_card: bool = field(default=True, metadata={"help": "Include opponent card in global context."})
+    use_opponent_reasoning: bool = field(default=True, metadata={"help": "Include opponent reasoning in global context."})
+    signal_mode: str = field(
+        default="reward_bonus",
+        metadata={"help": "How to use teacher log-probs: 'reward_bonus' adds log-ratio to scores; 'kl_distill' adds KL(student||teacher) to actor loss."},
+    )
+    bonus_weight: float = field(default=0.1, metadata={"help": "Scale for reward_bonus signal."})
+    kl_coef: float = field(default=0.1, metadata={"help": "Scale for kl_distill loss term."})
+    global_state_prefix: str = field(
+        default="\n\n[Global context - training only]:",
+        metadata={"help": "Text separator prepended to global state context."},
+    )
+
+
+@dataclass
 class LLMProxyConfig:
     proxy_type: str = field(default="policy", metadata={"help": "llm proxy type: [policy, openai, random]."})
     proxy_config: Dict = field(default_factory=dict, metadata={"help": "llm proxy config."})
@@ -315,6 +339,8 @@ class AgenticConfig(PPOConfig):
         default=10,
         metadata={"help": "Number of consecutive steps below threshold before early stopping."},
     )
+
+    ctde: CTDEConfig = field(default_factory=CTDEConfig, metadata={"help": "Centralized Training Decentralized Execution config."})
 
     parse_tool_call_parameter_to_dict: bool = field(default=False, metadata={"help": "Parse tool call parameter to dict. for https://github.com/QwenLM/Qwen3-Coder/issues/444"})
 

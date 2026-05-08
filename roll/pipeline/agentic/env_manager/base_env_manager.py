@@ -19,6 +19,7 @@ class RolloutCache:
     terminated: bool = False
     step: int = 0
     init_state_id: Optional[str] = None
+    global_state: Optional[Dict] = None  # set at episode end; carries privileged info (e.g. opp card + reasoning) for CTDE
 
 
 class BaseEnvManager:

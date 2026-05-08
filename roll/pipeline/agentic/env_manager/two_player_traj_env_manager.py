@@ -45,6 +45,7 @@ class TwoPlayerTrajEnvManager(TrajEnvManager):
         self.enemy_pool: List[Optional[str]] = [None]
         self.current_opponent_lora: Optional[str] = None
         self.nash_probabilities: Optional[np.ndarray] = None
+        self._ctde_enabled: bool = getattr(getattr(self.pipeline_config, "ctde", None), "enabled", False)
 
     def reset(self) -> Optional[RolloutCache]:
         result = super().reset()
@@ -86,6 +87,22 @@ class TwoPlayerTrajEnvManager(TrajEnvManager):
             self.logger.info(f"Nash probabilities updated: {self.nash_probabilities.tolist()}")
         else:
             self.logger.info("Nash probabilities cleared; reverting to mode-based sampling.")
+
+    def _collect_global_state(self, info: dict) -> None:
+        """Populate rollout_cache.global_state from terminal info + opponent_history (CTDE only)."""
+        if not self._ctde_enabled:
+            return
+        gs = dict(info.get("global_state", {}))
+        opp_reasoning = ""
+        if self.opponent_history:
+            last_opp = self.opponent_history[-1]
+            resp_ids = last_opp.get("response_ids", [])
+            if resp_ids:
+                raw = self.tokenizer.decode(resp_ids, skip_special_tokens=True)
+                m = re.search(r'<think>(.*?)</think>', raw, re.DOTALL)
+                opp_reasoning = m.group(1).strip() if m else raw.strip()
+        gs["opp_reasoning"] = opp_reasoning
+        self.rollout_cache.global_state = gs
 
     def _maybe_prepend_opponent_reasoning(self, observation: str, opponent_response: str) -> str:
         """If include_opponent_reasoning is enabled, prepend opponent's <think> block to observation."""
@@ -210,6 +227,8 @@ class TwoPlayerTrajEnvManager(TrajEnvManager):
             self.rollout_cache.terminated = True
             self.rollout_cache.truncated = agent_truncated
             self.rollout_cache.history[-1]['reward'] = agent_reward
+            if agent_step_info is not None:
+                self._collect_global_state(agent_step_info)
             self.rollout_cache.history.append({
                 "observation": "",
                 "actions_left": self.env_config.max_steps - self.rollout_cache.step,
@@ -274,6 +293,8 @@ class TwoPlayerTrajEnvManager(TrajEnvManager):
                 self.rollout_cache.truncated = True
 
         self.rollout_cache.history[-1]['reward'] = reward
+        if (self.rollout_cache.terminated or terminated) and info is not None:
+            self._collect_global_state(info)
         if info is not None:
             # Merge opponent's env.step info without clobbering agent-side metrics
             # recorded earlier. 'action_is_valid' is re-keyed as 'opponent/action_is_valid'
@@ -314,9 +335,14 @@ class TwoPlayerTrajEnvManager(TrajEnvManager):
         lm_input = super().formulate_rollouts(rollout_cache)
         if lm_input is not None:
             opponent_id = str(self.current_opponent_lora) if self.current_opponent_lora is not None else "base"
+            batch_size = lm_input.batch.batch_size[0]
             lm_input.non_tensor_batch["opponent_id"] = np.array(
-                [opponent_id] * lm_input.batch.batch_size[0], dtype=object
+                [opponent_id] * batch_size, dtype=object
             )
+            if self._ctde_enabled and rollout_cache.global_state is not None:
+                lm_input.non_tensor_batch["global_state"] = np.array(
+                    [rollout_cache.global_state] * batch_size, dtype=object
+                )
         return lm_input
 
     def _format_opponent_messages(self, observation: str) -> DataProto:
