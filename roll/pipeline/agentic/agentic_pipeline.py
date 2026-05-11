@@ -555,7 +555,6 @@ class AgenticPipeline(BasePipeline):
                             )
                             batch_balance(priv_batch, dp_size=self.actor_train.dp_size, minibatch_size=len(priv_batch))
                             priv_batch.meta_info["is_offload_states"] = False
-                            priv_batch.meta_info["loss_mask_keys"] = ["response_mask"]
                             teacher_lp_refs: List[ray.ObjectRef] = self.actor_train.compute_log_probs(
                                 priv_batch, blocking=False
                             )
@@ -819,55 +818,9 @@ class AgenticPipeline(BasePipeline):
                             _generation_steps = fsp_save_steps
                         else:
                             _generation_steps = max(1, self.pipeline_config.max_steps - global_step)
-
-                        svd_cfg = self.pipeline_config.svd_warm_start
-                        _use_warm_start = (
-                            svd_cfg.enabled
-                            and self._latest_nash_probs is not None
-                            and len(self.fsp_checkpoints) >= svd_cfg.min_population_size
-                        )
-                        if _use_warm_start:
-                            from roll.pipeline.agentic import svd_warm_start as _svd
-                            logger.info(
-                                f"svd_warm_start: applying at step {global_step} "
-                                f"(population={len(self.fsp_checkpoints)}, next_gen={_generation_steps} steps)"
-                            )
-                            _lora_rank = self.pipeline_config.actor_train.model_args.lora_rank
-                            _sd, _meta = _svd.build_warm_start_state_dict(
-                                lora_paths=self.fsp_checkpoints,
-                                nash_probs=self._latest_nash_probs,
-                                cfg=svd_cfg,
-                                lora_rank=_lora_rank,
-                                model_dtype=torch.float32,
-                                seed=self.pipeline_config.seed + global_step,
-                            )
-                            self.actor_train.apply_lora_state_dict_warm_start(
-                                _sd,
-                                _generation_steps,
-                                missing_param_policy=svd_cfg.missing_param_policy,
-                                blocking=True,
-                            )
-                            for k, v in _meta.items():
-                                metrics[f"svd_warm_start/{k}"] = v
-                        else:
-                            _fallback = svd_cfg.first_iteration_fallback if svd_cfg.enabled else "cold_start"
-                            if _fallback == "cold_start":
-                                logger.info(
-                                    f"svd_warm_start: prerequisites not met "
-                                    f"(population={len(self.fsp_checkpoints)} < min_population_size={svd_cfg.min_population_size} "
-                                    f"or no Nash probs), falling back to cold_start at step {global_step} "
-                                    f"(next generation = {_generation_steps} steps)"
-                                )
-                                self.actor_train.reset_lora_weights(_generation_steps, blocking=True)
-                            elif _fallback == "no_op":
-                                logger.info("svd_warm_start: prerequisites not met, first_iteration_fallback=no_op, keeping current LoRA weights.")
-                            elif _fallback == "raise":
-                                raise RuntimeError(
-                                    f"svd_warm_start enabled but prerequisites not met "
-                                    f"(population={len(self.fsp_checkpoints)} < min_population_size={svd_cfg.min_population_size} "
-                                    f"or no Nash probs)"
-                                )
-
+                        logger.info(f"FSP cold_start: resetting training LoRA weights at step {global_step} "
+                                    f"(next generation = {_generation_steps} steps)")
+                        self.actor_train.reset_lora_weights(_generation_steps, blocking=True)
                         if self.pipeline_config.async_pipeline:
                             self._pending_fsp_flush = True
 
