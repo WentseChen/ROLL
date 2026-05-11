@@ -851,13 +851,13 @@ class AgenticPipeline(BasePipeline):
                                 model_dtype=torch.float32,
                                 seed=int(seed_base) + int(global_step) + int(svd_cfg.seed_offset),
                             )
-                            if self.pipeline_config.async_pipeline:
-                                self._pending_fsp_flush = True
                             self.actor_train.apply_lora_state_dict_warm_start(
                                 sd, _generation_steps,
                                 missing_param_policy=svd_cfg.missing_param_policy,
                                 blocking=True,
                             )
+                            if self.pipeline_config.async_pipeline:
+                                self._pending_fsp_flush = True
                             for mk, mv in meta.items():
                                 metrics[f"svd_warm_start/{mk}"] = mv
                             logger.info(

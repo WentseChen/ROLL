@@ -146,9 +146,12 @@ def test_phase3_residual_noise_scope_none():
 
 
 def test_phase3_shrink_factor_below_one():
+    """shrink_factor scales the EFFECTIVE principal contribution (B @ A) by exactly
+    shrink_factor — matches classical Shrink-and-Perturb W := lambda*W + epsilon.
+    Per-factor scaling would give shrink_factor^2, which is wrong.
+    """
     shrink = 0.5
     W = torch.randn(8, 16, generator=torch.Generator().manual_seed(11))
-    # Run twice: shrink=1.0 then shrink=0.5; principal slice should scale by `shrink`.
     A1, B1, k1, _ = sws.svd_truncate_and_perturb(
         W, lora_rank=8, truncation_policy="fixed", truncation_rank=3, energy_threshold=0.9,
         shrink_factor=1.0, residual_noise_scope="none", perturbation_sigma=0.0,
@@ -160,8 +163,9 @@ def test_phase3_shrink_factor_below_one():
         generator=torch.Generator().manual_seed(0), output_dtype=torch.float64,
     )
     assert k1 == k2 == 3
-    torch.testing.assert_close(A2[:k2, :], A1[:k1, :] * shrink, rtol=1e-6, atol=1e-6)
-    torch.testing.assert_close(B2[:, :k2], B1[:, :k1] * shrink, rtol=1e-6, atol=1e-6)
+    reconstructed1 = B1[:, :k1] @ A1[:k1, :]
+    reconstructed2 = B2[:, :k2] @ A2[:k2, :]
+    torch.testing.assert_close(reconstructed2, shrink * reconstructed1, rtol=1e-6, atol=1e-6)
 
 
 # ---------- Missing-adapter handling ---------- #
@@ -244,16 +248,20 @@ def test_nan_W_meta_raises_in_svd():
         )
 
 
-def test_zero_W_meta_warns_no_crash(caplog):
+def test_zero_W_meta_warns_no_crash(monkeypatch):
+    # ROLL's logger doesn't propagate to root; intercept logger.warning directly.
+    seen = []
+    monkeypatch.setattr(sws.logger, "warning", lambda msg, *a, **kw: seen.append(str(msg)))
     W = torch.zeros(4, 8)
     A_new, B_new, k, energy = sws.svd_truncate_and_perturb(
         W, lora_rank=4, truncation_policy="fixed", truncation_rank=2, energy_threshold=0.9,
         shrink_factor=1.0, residual_noise_scope="a_only", perturbation_sigma=0.01,
         generator=torch.Generator().manual_seed(0), output_dtype=torch.float32,
     )
-    assert torch.all(A_new[:k, :] == 0)  # sqrt(0)=0
+    assert torch.all(A_new[:k, :] == 0)
     assert torch.all(B_new[:, :k] == 0)
     assert energy == 0.0
+    assert any("zero-energy" in m for m in seen), f"expected zero-energy warning, got: {seen!r}"
 
 
 # ---------- Seed reproducibility ---------- #

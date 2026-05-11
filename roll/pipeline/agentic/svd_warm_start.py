@@ -16,6 +16,7 @@ name) so the actor can look up keys directly off model.module.named_parameters()
 
 from __future__ import annotations
 
+import math
 import os
 import time
 from typing import Optional
@@ -128,6 +129,11 @@ def pick_truncation_rank(
     total = float(energy.sum().item())
     upper = max(1, lora_rank - 1)
 
+    # Also clip k to the number of singular values returned. For non-square LoRA
+    # targets where min(d_out, d_in) < lora_rank-1 (rare but possible), this avoids
+    # a shape mismatch when assigning B_new[:, :k] = B_top.
+    upper = max(1, min(upper, int(sv.numel())))
+
     if truncation_policy == "fixed":
         k = max(1, min(truncation_rank, upper))
     elif truncation_policy == "energy":
@@ -177,9 +183,13 @@ def svd_truncate_and_perturb(
         S, truncation_policy, truncation_rank, energy_threshold, lora_rank,
     )
 
+    # Apply sqrt(shrink_factor) to each factor so the effective principal
+    # contribution (B_top @ A_top) is scaled by shrink_factor exactly once —
+    # matches classical Shrink-and-Perturb (W := lambda * W + epsilon).
     sqrt_S_top = torch.sqrt(S[:k].clamp(min=0.0))
-    B_top = U[:, :k] * sqrt_S_top.unsqueeze(0) * shrink_factor              # (d_out, k)
-    A_top = sqrt_S_top.unsqueeze(1) * Vh[:k, :] * shrink_factor             # (k, d_in)
+    sqrt_shrink = math.sqrt(shrink_factor) if shrink_factor > 0 else 0.0
+    B_top = U[:, :k] * sqrt_S_top.unsqueeze(0) * sqrt_shrink                # (d_out, k)
+    A_top = sqrt_S_top.unsqueeze(1) * Vh[:k, :] * sqrt_shrink               # (k, d_in)
 
     A_new = torch.zeros((lora_rank, d_in), dtype=W_meta.dtype, device=W_meta.device)
     B_new = torch.zeros((d_out, lora_rank), dtype=W_meta.dtype, device=W_meta.device)
