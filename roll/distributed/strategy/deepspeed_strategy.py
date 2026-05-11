@@ -595,11 +595,21 @@ class DeepSpeedTrainStrategy(DeepSpeedInferStrategy, TrainStrategy):
                     nn_init.zeros_(param.data)
                 num_b += 1
 
+        num_fp32_synced, total_scheduler_steps = self._post_lora_reset_housekeeping(num_training_steps)
+        logger.info(f"reset_lora_weights: reinit {num_a} lora_A + {num_b} lora_B params; "
+                    f"synced {num_fp32_synced} fp32 master groups; Adam state cleared; "
+                    f"LR scheduler rebuilt for {total_scheduler_steps} scheduler steps "
+                    f"(= {num_training_steps} pipeline steps)")
+        return {"lora_A_reset": num_a, "lora_B_reset": num_b}
+
+    def _post_lora_reset_housekeeping(self, num_training_steps: int) -> tuple[int, int]:
+        """fp32 master sync + Adam state clear + LR scheduler rebuild.
+
+        Shared between reset_lora_weights and apply_lora_state_dict_warm_start.
+        Returns (num_fp32_synced, total_scheduler_steps) for logging.
+        """
         # ZeRO (stage 1/2/3) + bf16: sync fp32 master <- bf16 so optimizer.step()
-        # won't revert bf16 from stale fp32. Both DeepSpeedZeroOptimizer (stage 1/2,
-        # stage_1_and_2.py:2216) and DeepSpeedZeroOptimizer_Stage3 (stage3.py:2602)
-        # expose refresh_fp32_params(). All trainable params are LoRA, so syncing
-        # the whole partitioned groups is correct.
+        # won't revert bf16 from stale fp32.
         num_fp32_synced = 0
         if hasattr(self.optimizer, "refresh_fp32_params"):
             try:
@@ -608,7 +618,7 @@ class DeepSpeedTrainStrategy(DeepSpeedInferStrategy, TrainStrategy):
                                        getattr(self.optimizer, "single_partition_of_fp32_groups", []))
                 num_fp32_synced = len(fp32_groups)
             except Exception as e:
-                logger.warning(f"reset_lora_weights: refresh_fp32_params failed: {e}")
+                logger.warning(f"_post_lora_reset_housekeeping: refresh_fp32_params failed: {e}")
 
         # Clear optimizer (Adam) state. With LoRA training, only LoRA params are
         # trainable, so this clears only LoRA Adam state.
@@ -616,12 +626,10 @@ class DeepSpeedTrainStrategy(DeepSpeedInferStrategy, TrainStrategy):
             base_opt = getattr(self.optimizer, "optimizer", self.optimizer)
             base_opt.state = defaultdict(dict)
         except Exception as e:
-            logger.warning(f"reset_lora_weights: failed to clear optimizer state: {e}")
+            logger.warning(f"_post_lora_reset_housekeeping: failed to clear optimizer state: {e}")
 
-        # Rebuild LR scheduler from step 0. num_training_steps is in global pipeline-step
-        # units; convert to actual scheduler steps (multiple per pipeline step). A failure
-        # here leaves the scheduler desynced from the optimizer; raise hard so PSRO resets
-        # never silently continue with a corrupted training loop.
+        # Rebuild LR scheduler from step 0. A failure here leaves the scheduler desynced
+        # from the optimizer; raise hard so PSRO resets never silently corrupt training.
         total_scheduler_steps = self._compute_scheduler_steps(num_training_steps)
         sched_opt = getattr(self.scheduler, "optimizer", None) or self.optimizer
         new_scheduler = get_scheduler(
@@ -633,12 +641,80 @@ class DeepSpeedTrainStrategy(DeepSpeedInferStrategy, TrainStrategy):
         self.scheduler = new_scheduler
         if hasattr(self.model, "lr_scheduler"):
             self.model.lr_scheduler = new_scheduler
+        return num_fp32_synced, total_scheduler_steps
 
-        logger.info(f"reset_lora_weights: reinit {num_a} lora_A + {num_b} lora_B params; "
-                    f"synced {num_fp32_synced} fp32 master groups; Adam state cleared; "
-                    f"LR scheduler rebuilt for {total_scheduler_steps} scheduler steps "
-                    f"(= {num_training_steps} pipeline steps)")
-        return {"lora_A_reset": num_a, "lora_B_reset": num_b}
+    @torch.no_grad()
+    def apply_lora_state_dict_warm_start(
+        self,
+        lora_state_dict: dict,
+        num_training_steps: int,
+        missing_param_policy: str = "kaiming_zero",
+    ) -> dict:
+        """Load externally-computed LoRA tensors into model.module's lora_A/B params,
+        then run the same housekeeping as reset_lora_weights.
+
+        Keys in lora_state_dict must match model.module.named_parameters() names
+        (e.g., base_model.model.<path>.lora_{A,B}.default.weight).
+
+        missing_param_policy in {"kaiming_zero", "raise"} controls behavior when a
+        model LoRA param has no key in lora_state_dict.
+        """
+        import math
+        import torch.nn.init as nn_init
+
+        num_loaded_a = num_loaded_b = 0
+        num_missing_a = num_missing_b = 0
+        is_zero3 = self.ds_config.is_zero3()
+        for name, param in self.model.module.named_parameters():
+            is_a = "lora_A" in name
+            is_b = "lora_B" in name
+            if not (is_a or is_b):
+                continue
+
+            def _copy_or_fallback():
+                nonlocal num_loaded_a, num_loaded_b, num_missing_a, num_missing_b
+                src = lora_state_dict.get(name)
+                if src is not None:
+                    if src.shape != param.data.shape:
+                        raise RuntimeError(
+                            f"apply_lora_state_dict_warm_start: shape mismatch for {name}: "
+                            f"got {tuple(src.shape)}, expected {tuple(param.data.shape)}"
+                        )
+                    param.data.copy_(src.to(device=param.data.device, dtype=param.data.dtype))
+                    if is_a:
+                        num_loaded_a += 1
+                    else:
+                        num_loaded_b += 1
+                else:
+                    if missing_param_policy == "raise":
+                        raise KeyError(f"apply_lora_state_dict_warm_start: no key for {name}")
+                    if is_a:
+                        nn_init.kaiming_uniform_(param.data, a=math.sqrt(5))
+                        num_missing_a += 1
+                    else:
+                        nn_init.zeros_(param.data)
+                        num_missing_b += 1
+
+            if is_zero3:
+                with GatheredParameters([param], modifier_rank=0):
+                    _copy_or_fallback()
+            else:
+                _copy_or_fallback()
+
+        num_fp32_synced, total_scheduler_steps = self._post_lora_reset_housekeeping(num_training_steps)
+        logger.info(
+            f"apply_lora_state_dict_warm_start: loaded {num_loaded_a} lora_A + {num_loaded_b} lora_B; "
+            f"missing {num_missing_a} lora_A + {num_missing_b} lora_B (policy={missing_param_policy}); "
+            f"synced {num_fp32_synced} fp32 master groups; Adam state cleared; "
+            f"LR scheduler rebuilt for {total_scheduler_steps} scheduler steps "
+            f"(= {num_training_steps} pipeline steps)"
+        )
+        return {
+            "lora_A_loaded": num_loaded_a,
+            "lora_B_loaded": num_loaded_b,
+            "lora_A_missing": num_missing_a,
+            "lora_B_missing": num_missing_b,
+        }
 
     def save_checkpoint(self, save_dir, global_step, ckpt_id, tag="checkpoint", local_state_path=None, is_last_step=None, **kwargs):
         """

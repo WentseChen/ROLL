@@ -238,6 +238,76 @@ class EnvMonitorConfig:
 
 
 @dataclass
+class SVDWarmStartConfig:
+    """SVD-empowered PSRO warm start. Replaces cold_start LoRA reset with a
+    Nash-weighted SVD decomposition of the population's accumulated LoRA
+    knowledge, followed by Shrink-and-Perturb refactorization.
+    """
+    enabled: bool = field(
+        default=False,
+        metadata={"help": "Replace cold_start reset with SVD-decomposed warm start over the Nash-weighted population."},
+    )
+
+    # Phase 2 — truncation policy
+    truncation_policy: Literal["fixed", "energy"] = field(
+        default="fixed",
+        metadata={"help": "How to pick k per module. 'fixed' uses truncation_rank; 'energy' picks smallest k whose top-k captures energy_threshold of singular-value energy."},
+    )
+    truncation_rank: int = field(
+        default=8,
+        metadata={"help": "[fixed policy] Top-k singular components retained per LoRA module. Must be < lora_rank."},
+    )
+    energy_threshold: float = field(
+        default=0.9,
+        metadata={"help": "[energy policy] Fraction of singular-value energy to retain (0 < x < 1)."},
+    )
+
+    # Phase 3 — shrink-and-perturb
+    shrink_factor: float = field(
+        default=1.0,
+        metadata={"help": "Multiplier on the top-k principal components. 1.0 preserves; (0,1) enables Shrink on principal axes."},
+    )
+    residual_noise_scope: Literal["a_only", "a_and_b", "none"] = field(
+        default="a_only",
+        metadata={"help": "Where to inject N(0, perturbation_sigma^2) noise into the residual (r-k) slice."},
+    )
+    perturbation_sigma: float = field(
+        default=1e-3,
+        metadata={"help": "Std of Gaussian noise injected into residual slice."},
+    )
+
+    # Population / runtime knobs
+    min_population_size: int = field(
+        default=2,
+        metadata={"help": "Min number of policies in the FSP population (including base placeholder) required to apply warm start."},
+    )
+    first_iteration_fallback: Literal["cold_start", "no_op", "raise"] = field(
+        default="cold_start",
+        metadata={"help": "Behavior when warm-start prerequisites are not yet met."},
+    )
+    missing_adapter_policy: Literal["skip", "raise"] = field(
+        default="skip",
+        metadata={"help": "If an adapter file is missing/corrupt at warm-start time. 'skip' renormalizes Nash over remaining adapters."},
+    )
+    missing_param_policy: Literal["kaiming_zero", "raise"] = field(
+        default="kaiming_zero",
+        metadata={"help": "If a model LoRA param has no key in the warm-start state dict (e.g., target_modules mismatch)."},
+    )
+    adapter_load_timeout_s: int = field(
+        default=120,
+        metadata={"help": "Max wait for an in-flight async-uploaded adapter_model.safetensors."},
+    )
+    compute_dtype: Literal["float32", "float64"] = field(
+        default="float32",
+        metadata={"help": "Dtype for Meta-LoRA aggregation and SVD. float64 if numerical instability is observed."},
+    )
+    seed_offset: int = field(
+        default=0,
+        metadata={"help": "Added to global seed + global_step when drawing residual noise. Bump to vary realization without changing global seed."},
+    )
+
+
+@dataclass
 class AgenticConfig(PPOConfig):
     # agentic related
     custom_envs: Dict[str, Any] = field(default_factory=dict, metadata={"help": "List of environment configurations."})
@@ -251,6 +321,10 @@ class AgenticConfig(PPOConfig):
     fsp_score_timeout: int = field(default=150, metadata={"help": "If fsp_score_threshold > 0, also trigger FSP switch when score fails to reach threshold for this many steps. 0 = disabled."})
     fsp_score_threshold_start: float = field(default=0.0, metadata={"help": "If > 0, linearly decay fsp_score_threshold from this value down to fsp_score_threshold_end over fsp_score_timeout steps per generation. Overrides fsp_score_threshold when set."})
     fsp_score_threshold_end: float = field(default=0.0, metadata={"help": "End value for linear threshold decay (used when fsp_score_threshold_start > 0)."})
+    svd_warm_start: SVDWarmStartConfig = field(
+        default_factory=SVDWarmStartConfig,
+        metadata={"help": "SVD-empowered PSRO warm start config (gates and parameterizes the warm-start replacement of cold_start)."},
+    )
     psro_mode: bool = field(default=False, metadata={"help": "Enable PSRO: expand PayoffMatrix and compute Nash after each FSP generation."})
     psro_episodes_per_pair: int = field(default=32, metadata={"help": "PSRO: episodes per (i,j) policy pair during payoff matrix expansion."})
     psro_max_concurrent_eval: Optional[int] = field(default=None, metadata={"help": "PSRO: max concurrent arena episodes during expand_matrix. Defaults to psro_bubble_eval_episodes if set, else 256."})
@@ -488,6 +562,27 @@ class AgenticConfig(PPOConfig):
 
         # Apply OPD configuration at the end (handles student_train/student_infer/teacher mapping)
         self._apply_opd_config()
+
+        self._validate_svd_warm_start()
+
+    def _validate_svd_warm_start(self):
+        cfg = self.svd_warm_start
+        if not cfg.enabled:
+            return
+        assert self.cold_start, "svd_warm_start.enabled requires cold_start=True (warm-start hook lives inside the cold_start branch)."
+        lora_rank = getattr(self.actor_train.model_args, "lora_rank", None)
+        assert lora_rank is not None and lora_rank > 0, "svd_warm_start.enabled requires actor_train.model_args.lora_rank > 0."
+        if cfg.truncation_policy == "fixed":
+            assert 0 < cfg.truncation_rank < lora_rank, (
+                f"svd_warm_start.truncation_rank ({cfg.truncation_rank}) must be in (0, lora_rank={lora_rank})."
+            )
+        else:
+            assert 0 < cfg.energy_threshold < 1, (
+                f"svd_warm_start.energy_threshold ({cfg.energy_threshold}) must be in (0, 1)."
+            )
+        assert 0 < cfg.shrink_factor <= 1, f"svd_warm_start.shrink_factor ({cfg.shrink_factor}) must be in (0, 1]."
+        assert cfg.perturbation_sigma >= 0, f"svd_warm_start.perturbation_sigma ({cfg.perturbation_sigma}) must be >= 0."
+        assert cfg.min_population_size >= 2, f"svd_warm_start.min_population_size ({cfg.min_population_size}) must be >= 2."
 
     def make_env_configs(self, env_manager_config: EnvManagerConfig):
         # construct env configs

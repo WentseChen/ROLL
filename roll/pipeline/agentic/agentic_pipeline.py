@@ -826,11 +826,71 @@ class AgenticPipeline(BasePipeline):
                             _generation_steps = fsp_save_steps
                         else:
                             _generation_steps = max(1, self.pipeline_config.max_steps - global_step)
-                        logger.info(f"FSP cold_start: resetting training LoRA weights at step {global_step} "
-                                    f"(next generation = {_generation_steps} steps)")
-                        self.actor_train.reset_lora_weights(_generation_steps, blocking=True)
-                        if self.pipeline_config.async_pipeline:
-                            self._pending_fsp_flush = True
+
+                        svd_cfg = self.pipeline_config.svd_warm_start
+                        use_warm_start = (
+                            svd_cfg.enabled
+                            and self._latest_nash_probs is not None
+                            and len(self.fsp_checkpoints) >= svd_cfg.min_population_size
+                        )
+
+                        if use_warm_start:
+                            from roll.pipeline.agentic import svd_warm_start as svd_ws
+                            seed_base = getattr(self.pipeline_config, "seed", 0) or 0
+                            lora_rank = self.pipeline_config.actor_train.model_args.lora_rank
+                            logger.info(
+                                f"FSP svd_warm_start: building meta-LoRA at step {global_step} "
+                                f"(population={len(self.fsp_checkpoints)}, lora_rank={lora_rank}, "
+                                f"next generation = {_generation_steps} steps)"
+                            )
+                            sd, meta = svd_ws.build_warm_start_state_dict(
+                                lora_paths=self.fsp_checkpoints,
+                                nash_probs=list(self._latest_nash_probs),
+                                cfg=svd_cfg,
+                                lora_rank=lora_rank,
+                                model_dtype=torch.float32,
+                                seed=int(seed_base) + int(global_step) + int(svd_cfg.seed_offset),
+                            )
+                            if self.pipeline_config.async_pipeline:
+                                self._pending_fsp_flush = True
+                            self.actor_train.apply_lora_state_dict_warm_start(
+                                sd, _generation_steps,
+                                missing_param_policy=svd_cfg.missing_param_policy,
+                                blocking=True,
+                            )
+                            for mk, mv in meta.items():
+                                metrics[f"svd_warm_start/{mk}"] = mv
+                            logger.info(
+                                f"FSP svd_warm_start: applied (k_mean={meta['k_mean']:.1f}, "
+                                f"energy_retained_mean={meta['energy_retained_mean']:.3f}, "
+                                f"n_modules={int(meta['n_modules'])}, "
+                                f"n_population={int(meta['n_population'])}, "
+                                f"n_skipped={int(meta['n_adapters_skipped'])})"
+                            )
+                        else:
+                            fallback = svd_cfg.first_iteration_fallback if svd_cfg.enabled else "cold_start"
+                            if fallback == "cold_start":
+                                logger.info(
+                                    f"FSP cold_start: resetting training LoRA weights at step {global_step} "
+                                    f"(next generation = {_generation_steps} steps)"
+                                )
+                                self.actor_train.reset_lora_weights(_generation_steps, blocking=True)
+                                if self.pipeline_config.async_pipeline:
+                                    self._pending_fsp_flush = True
+                            elif fallback == "no_op":
+                                logger.info(
+                                    f"FSP svd_warm_start: prereqs not met "
+                                    f"(population={len(self.fsp_checkpoints)} < "
+                                    f"min_population_size={svd_cfg.min_population_size}); "
+                                    f"first_iteration_fallback=no_op, keeping current LoRA weights."
+                                )
+                            elif fallback == "raise":
+                                raise RuntimeError(
+                                    "svd_warm_start enabled but prereqs not met "
+                                    f"(population={len(self.fsp_checkpoints)} < "
+                                    f"min_population_size={svd_cfg.min_population_size} "
+                                    f"or no Nash probs)."
+                                )
 
                 with Timer(name="log", logger=None) as log_timer:
                     if self.pipeline_config.logging_steps > 0 and global_step % self.pipeline_config.logging_steps == 0:
