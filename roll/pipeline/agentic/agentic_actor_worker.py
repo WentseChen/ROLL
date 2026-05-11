@@ -99,6 +99,7 @@ class ActorWorker(BaseActorWorker):
             total_loss = pg_loss
 
         ctde_cfg = getattr(self.pipeline_config, "ctde", None)
+        ctde_kl_distill_metric = {}
         if (
             ctde_cfg is not None
             and ctde_cfg.enabled
@@ -114,7 +115,7 @@ class ActorWorker(BaseActorWorker):
                 global_valid_samples=global_valid_samples["response_mask"],
             )
             total_loss = total_loss + ctde_cfg.kl_coef * kl_distill
-            pg_metrics["ctde/kl_distill@sum"] = kl_distill.detach().item()
+            ctde_kl_distill_metric["ctde/kl_distill@sum"] = kl_distill.detach().item()
         entropy = self.strategy.op_compute_entropy(
             logits=output_tensor, attention_mask=data.batch["response_mask"]
         )
@@ -161,6 +162,7 @@ class ActorWorker(BaseActorWorker):
                 batch_num_tokens=batch_num_tokens['response_mask'], global_valid_samples=global_valid_samples['response_mask']
             ).detach().item(),
             **train_infer_metric,
+            **ctde_kl_distill_metric,
         }
 
         return total_loss, pg_metrics

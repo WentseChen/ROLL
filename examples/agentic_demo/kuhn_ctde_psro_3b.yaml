@@ -10,7 +10,7 @@ hydra:
     dir: .
   output_subdir: null
 
-exp_name: "kuhn_ctde_psro_3b"
+exp_name: "kuhn_ctde_psro_3b_bw0p1_lennorm"
 seed: 42
 logging_dir: /zfsauton/scratch/wentsec/kuhn_poker_output/logs
 output_dir: /zfsauton/scratch/wentsec/kuhn_poker_output

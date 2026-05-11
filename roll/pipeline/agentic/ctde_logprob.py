@@ -22,22 +22,42 @@ CARD_NAMES = {0: "Jack", 1: "Queen", 2: "King"}
 
 
 def format_global_context(global_state: dict, ctde_config: CTDEConfig) -> str:
-    """Build the global-context string appended to the prompt for the teacher pass."""
+    """Build the global-context string appended to the user turn for the teacher pass.
+
+    Produces a natural paragraph so the privileged information reads coherently
+    to the model rather than looking like a debug dump.
+    """
     if not global_state:
         return ""
-    parts = [ctde_config.global_state_prefix]
+
+    card_part = ""
+    reasoning_part = ""
+
     if ctde_config.use_opponent_card:
         opp_card_val = global_state.get("opp_card")
         if opp_card_val is not None:
-            parts.append(f" Opponent holds {CARD_NAMES.get(int(opp_card_val), str(opp_card_val))}.")
+            card_name = CARD_NAMES.get(int(opp_card_val), str(opp_card_val))
+            card_part = f"your opponent is holding a {card_name}"
+
     if ctde_config.use_opponent_reasoning:
-        opp_reasoning = global_state.get("opp_reasoning", "")
+        opp_reasoning = global_state.get("opp_reasoning", "").strip()
+        # Strip any residual <think>...</think> tags so the text reads naturally
+        opp_reasoning = re.sub(r"</?think>", "", opp_reasoning).strip()
         if opp_reasoning:
-            parts.append(f" Opponent's reasoning: <think>{opp_reasoning}</think>")
-    if len(parts) == 1:
-        # Only prefix, no actual content — skip
+            reasoning_part = f'Before acting, their private reasoning was: "{opp_reasoning}"'
+
+    if not card_part and not reasoning_part:
         return ""
-    return "".join(parts)
+
+    # Combine into a single natural paragraph
+    if card_part and reasoning_part:
+        body = f"For this hand, {card_part}. {reasoning_part}"
+    elif card_part:
+        body = f"For this hand, {card_part}."
+    else:
+        body = reasoning_part
+
+    return f"\n\n{body}\nKnowing this, what is your reasoning and action?"
 
 
 def build_privileged_batch(
@@ -89,12 +109,26 @@ def build_privileged_batch(
             ctx_ids = []
         K = len(ctx_ids)
 
-        # Splice: first_prompt | global_ctx | rest (non-pad only)
-        first_prompt = input_ids[i, :first_resp_idx]
-        rest_non_pad = input_ids[i, first_resp_idx:non_pad_len]
+        # Insert global context inside the user turn, right before the last <|im_end|>
+        # in the prompt portion.  This produces a valid chat structure:
+        #   <|im_start|>user\n{obs}\n\n[Global context...]\n<|im_end|>
+        #   <|im_start|>assistant\n{original response}
+        # Inserting at first_resp_idx (after <|im_start|>assistant\n) would place the
+        # ctx inside the assistant turn, making the structure incoherent.
+        im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+        prompt_tokens = input_ids[i, :first_resp_idx]
+        im_end_pos_in_prompt = (prompt_tokens == im_end_id).nonzero(as_tuple=True)[0]
+        if len(im_end_pos_in_prompt) > 0:
+            insert_pos = int(im_end_pos_in_prompt[-1].item())  # before last <|im_end|>
+        else:
+            insert_pos = first_resp_idx  # fallback for non-standard templates
+
+        prefix = input_ids[i, :insert_pos]
+        suffix_prompt = input_ids[i, insert_pos:first_resp_idx]
+        response_tokens = input_ids[i, first_resp_idx:non_pad_len]
 
         ctx_tensor = torch.tensor(ctx_ids, dtype=torch.long, device=device)
-        new_tokens = torch.cat([first_prompt, ctx_tensor, rest_non_pad], dim=0)
+        new_tokens = torch.cat([prefix, ctx_tensor, suffix_prompt, response_tokens], dim=0)
         new_non_pad_len = new_tokens.shape[0]
 
         # Truncate if exceeds max_seq_len
@@ -177,15 +211,17 @@ def align_teacher_logprobs(
     return teacher_lp  # [B, orig_len-1]
 
 
-def compute_ctde_reward_bonus(
+def compute_ctde_token_bonus(
     teacher_log_probs: torch.Tensor,
     infer_log_probs: torch.Tensor,
     response_mask: torch.Tensor,
     bonus_weight: float,
 ) -> torch.Tensor:
-    """Compute per-trajectory CTDE reward bonus from log-ratio of teacher vs student.
+    """Compute per-token CTDE bonus from teacher/student log-ratio, length-normalized.
 
-    log_ratio > 0: teacher more confident → action was correct → positive bonus.
+    Per-token bonus is bonus_weight * (log π_teacher - log π_student) / n_response_tokens.
+    Total per-trajectory contribution is bonus_weight * mean(log_ratio), independent of
+    length — kills the length-hacking incentive while preserving per-token gradient direction.
 
     Args:
         teacher_log_probs: [B, seq_len-1]
@@ -194,22 +230,17 @@ def compute_ctde_reward_bonus(
         bonus_weight:      scalar weight
 
     Returns:
-        bonus: [B, seq_len] with bonus at last response token position (matches scores layout)
+        per_token_bonus:  [B, seq_len-1]
+        log_ratio_mean:   [B] mean log-ratio per trajectory (for logging)
     """
-    resp_shifted = response_mask[:, 1:].float()  # [B, seq_len-1]
-    log_ratio = (teacher_log_probs - infer_log_probs) * resp_shifted  # [B, seq_len-1]
-    n_tokens = resp_shifted.sum(dim=-1).clamp(min=1.0)                # [B]
-    per_traj = log_ratio.sum(dim=-1) / n_tokens                       # [B]
+    resp_shifted = response_mask[:, 1:].float()                        # [B, seq_len-1]
+    log_ratio = (teacher_log_probs - infer_log_probs) * resp_shifted   # [B, seq_len-1]
 
-    # Place bonus at the last token of each sequence (same convention as scores)
-    bonus = torch.zeros_like(response_mask, dtype=torch.float)
-    seq_len = response_mask.shape[1]
-    for i in range(bonus.shape[0]):
-        resp_pos = response_mask[i].nonzero(as_tuple=True)[0]
-        if len(resp_pos) > 0:
-            last_pos = min(int(resp_pos[-1].item()), seq_len - 1)
-            bonus[i, last_pos] = bonus_weight * per_traj[i]
-    return bonus, per_traj
+    n_tokens = resp_shifted.sum(dim=-1, keepdim=True).clamp(min=1.0)   # [B, 1]
+    per_token_bonus = bonus_weight * log_ratio / n_tokens              # [B, seq_len-1]
+
+    log_ratio_mean = log_ratio.sum(dim=-1) / n_tokens.squeeze(-1)      # [B] for logging
+    return per_token_bonus, log_ratio_mean
 
 
 def _pad_or_trunc(t: torch.Tensor, length: int, pad_val: int) -> torch.Tensor:

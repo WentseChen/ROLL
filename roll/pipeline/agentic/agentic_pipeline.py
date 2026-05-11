@@ -543,7 +543,6 @@ class AgenticPipeline(BasePipeline):
                             from roll.pipeline.agentic.ctde_logprob import (
                                 build_privileged_batch,
                                 align_teacher_logprobs,
-                                compute_ctde_reward_bonus,
                             )
                             ctde_cfg = self.pipeline_config.ctde
                             priv_batch = build_privileged_batch(
@@ -555,6 +554,7 @@ class AgenticPipeline(BasePipeline):
                             )
                             batch_balance(priv_batch, dp_size=self.actor_train.dp_size, minibatch_size=len(priv_batch))
                             priv_batch.meta_info["is_offload_states"] = False
+                            priv_batch.meta_info["loss_mask_keys"] = ["response_mask"]
                             teacher_lp_refs: List[ray.ObjectRef] = self.actor_train.compute_log_probs(
                                 priv_batch, blocking=False
                             )
@@ -565,19 +565,6 @@ class AgenticPipeline(BasePipeline):
                                 orig_response_mask=batch.batch["response_mask"],
                             )
                             batch.batch["teacher_log_probs"] = teacher_log_probs
-
-                            if ctde_cfg.signal_mode == "reward_bonus":
-                                infer_lp = batch.batch.get("infer_logprobs", batch.batch.get("old_log_probs"))
-                                if infer_lp is not None:
-                                    bonus, log_ratio = compute_ctde_reward_bonus(
-                                        teacher_log_probs=teacher_log_probs,
-                                        infer_log_probs=infer_lp,
-                                        response_mask=batch.batch["response_mask"],
-                                        bonus_weight=ctde_cfg.bonus_weight,
-                                    )
-                                    batch.batch["scores"] = batch.batch["scores"] + bonus
-                                    metrics["ctde/log_ratio_mean"] = log_ratio.mean().item()
-                                    metrics["ctde/log_ratio_std"] = log_ratio.std().item()
                         metrics["time/step_ctde_teacher_logprobs"] = ctde_timer.last
 
                     # TODO 当前这个还没用处
@@ -617,6 +604,27 @@ class AgenticPipeline(BasePipeline):
                         # batch, kl_metrics = apply_kl_penalty(data=batch, kl_ctrl=self.kl_ctrl, kl_penalty=self.pipeline_config.kl_penalty)
                         batch, token_level_metrics = compute_token_reward(batch, self.pipeline_config, self.kl_ctrl)
                         metrics.update(token_level_metrics)
+
+                        # CTDE per-token bonus: add teacher/student log-ratio to each response token reward
+                        ctde_cfg = getattr(self.pipeline_config, "ctde", None)
+                        if (
+                            ctde_cfg is not None
+                            and ctde_cfg.enabled
+                            and ctde_cfg.signal_mode == "reward_bonus"
+                            and "teacher_log_probs" in batch.batch
+                        ):
+                            from roll.pipeline.agentic.ctde_logprob import compute_ctde_token_bonus
+                            infer_lp = batch.batch.get("infer_logprobs", batch.batch.get("old_log_probs"))
+                            if infer_lp is not None:
+                                per_token_bonus, log_ratio_mean = compute_ctde_token_bonus(
+                                    teacher_log_probs=batch.batch["teacher_log_probs"],
+                                    infer_log_probs=infer_lp,
+                                    response_mask=batch.batch["response_mask"],
+                                    bonus_weight=ctde_cfg.bonus_weight,
+                                )
+                                batch.batch["token_level_rewards"] = batch.batch["token_level_rewards"] + per_token_bonus
+                                metrics["ctde/log_ratio_mean"] = log_ratio_mean.mean().item()
+                                metrics["ctde/log_ratio_std"] = log_ratio_mean.std().item()
                     metrics["time/step_cal_token_reward"] = timer.last
 
                     with Timer(name="compute_advantage", logger=None) as timer:
