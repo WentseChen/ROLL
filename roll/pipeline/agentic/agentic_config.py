@@ -572,6 +572,13 @@ class AgenticConfig(PPOConfig):
         assert self.cold_start, "svd_warm_start.enabled requires cold_start=True (warm-start hook lives inside the cold_start branch)."
         lora_rank = getattr(self.actor_train.model_args, "lora_rank", None)
         assert lora_rank is not None and lora_rank > 0, "svd_warm_start.enabled requires actor_train.model_args.lora_rank > 0."
+        # Literal[...] is a static-type hint; Hydra/OmegaConf will accept any string. Validate at runtime.
+        assert cfg.truncation_policy in {"fixed", "energy"}, f"svd_warm_start.truncation_policy must be 'fixed' or 'energy', got {cfg.truncation_policy!r}."
+        assert cfg.residual_noise_scope in {"a_only", "a_and_b", "none"}, f"svd_warm_start.residual_noise_scope must be 'a_only'/'a_and_b'/'none', got {cfg.residual_noise_scope!r}."
+        assert cfg.compute_dtype in {"float32", "float64"}, f"svd_warm_start.compute_dtype must be 'float32' or 'float64', got {cfg.compute_dtype!r}."
+        assert cfg.first_iteration_fallback in {"cold_start", "no_op", "raise"}, f"svd_warm_start.first_iteration_fallback must be 'cold_start'/'no_op'/'raise', got {cfg.first_iteration_fallback!r}."
+        assert cfg.missing_adapter_policy in {"skip", "raise"}, f"svd_warm_start.missing_adapter_policy must be 'skip' or 'raise', got {cfg.missing_adapter_policy!r}."
+        assert cfg.missing_param_policy in {"kaiming_zero", "raise"}, f"svd_warm_start.missing_param_policy must be 'kaiming_zero' or 'raise', got {cfg.missing_param_policy!r}."
         if cfg.truncation_policy == "fixed":
             assert 0 < cfg.truncation_rank < lora_rank, (
                 f"svd_warm_start.truncation_rank ({cfg.truncation_rank}) must be in (0, lora_rank={lora_rank})."
@@ -583,6 +590,7 @@ class AgenticConfig(PPOConfig):
         assert 0 < cfg.shrink_factor <= 1, f"svd_warm_start.shrink_factor ({cfg.shrink_factor}) must be in (0, 1]."
         assert cfg.perturbation_sigma >= 0, f"svd_warm_start.perturbation_sigma ({cfg.perturbation_sigma}) must be >= 0."
         assert cfg.min_population_size >= 2, f"svd_warm_start.min_population_size ({cfg.min_population_size}) must be >= 2."
+        assert cfg.adapter_load_timeout_s > 0, f"svd_warm_start.adapter_load_timeout_s ({cfg.adapter_load_timeout_s}) must be > 0."
 
     def make_env_configs(self, env_manager_config: EnvManagerConfig):
         # construct env configs

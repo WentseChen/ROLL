@@ -34,10 +34,12 @@ checkpoint_config:
 
 num_gpus_per_node: 2
 
-# With min_population_size: 3 + fsp_save_steps: 1, smoke crosses both code paths:
-#   step 1: population=2 (base+ckpt1) < 3 → first_iteration_fallback=cold_start
-#   step 2: population=3 → SVD warm start applies
-#   step 3: population=4 → SVD warm start applies
+# With min_population_size: 3 + fsp_save_steps: 1 + psro_mode: true, smoke crosses both paths:
+#   step 1: ckpt1 appended → population=2 < 3 → first_iteration_fallback=cold_start
+#   step 2: ckpt2 appended → population=3, Nash computed → SVD warm-start applies
+#   step 3: ckpt3 appended → population=4, Nash computed → SVD warm-start applies
+# Note: warm-start also requires _latest_nash_probs != None — PSRO computes Nash for
+# any population >= 2 (psro_loop.on_policy_added), so the guard is satisfied at step 1+.
 max_steps: 4
 save_steps: 10000
 logging_steps: 1

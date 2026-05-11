@@ -82,19 +82,27 @@ def build_meta_lora(
 ) -> dict[str, torch.Tensor]:
     """Nash-weighted sum W_meta = sum_i pi_i * (B_i @ A_i) per module.
 
-    None entries (base model) contribute Delta W = 0 but their pi is consumed.
-    Caller is responsible for renormalizing nash_probs after dropping any
-    missing adapters; this function assumes the given (adapters, nash_probs)
-    are already aligned and renormalized.
+    None entries (base model) contribute Delta W = 0 but their pi *is consumed* —
+    base mass dilutes the principal slice rather than being renormalized away.
+    This matches the spec: W_meta = Sigma_i pi_i * (B_i @ A_i) over the full
+    population including the base placeholder.
+
+    NaN/Inf in any input adapter raises; SVD on NaN silently returns NaN and
+    would otherwise corrupt the actor's live LoRA weights.
     """
     if len(adapters) != len(nash_probs):
         raise ValueError(f"adapters/nash_probs length mismatch: {len(adapters)} vs {len(nash_probs)}")
     dtype = _resolve_dtype(compute_dtype)
     W_meta: dict[str, torch.Tensor] = {}
-    for prob, sd in zip(nash_probs, adapters):
+    for idx, (prob, sd) in enumerate(zip(nash_probs, adapters)):
         if sd is None:
             continue
         for module, (A, B) in group_lora_pairs_by_module(sd).items():
+            if not (torch.isfinite(A).all() and torch.isfinite(B).all()):
+                raise RuntimeError(
+                    f"svd_warm_start: non-finite values in adapter idx={idx} module={module}; "
+                    f"refusing to propagate NaN/Inf into LoRA params."
+                )
             contrib = float(prob) * (B.to(dtype) @ A.to(dtype))
             if module in W_meta:
                 W_meta[module] = W_meta[module] + contrib
@@ -155,7 +163,16 @@ def svd_truncate_and_perturb(
         B_new: (d_out, lora_rank)
     """
     d_out, d_in = W_meta.shape
+    if not torch.isfinite(W_meta).all():
+        raise RuntimeError("svd_warm_start.svd_truncate_and_perturb: non-finite W_meta.")
     U, S, Vh = torch.linalg.svd(W_meta, full_matrices=False)  # U:(d_out,p), S:(p,), Vh:(p,d_in)
+    if not (torch.isfinite(S).all() and torch.isfinite(U).all() and torch.isfinite(Vh).all()):
+        raise RuntimeError("svd_warm_start.svd_truncate_and_perturb: SVD produced non-finite outputs.")
+    if float(S.sum().item()) == 0.0:
+        logger.warning(
+            f"svd_warm_start: zero-energy spectrum for module of shape {tuple(W_meta.shape)}; "
+            f"output will be pure noise (or zero if residual_noise_scope=='none')."
+        )
     k, energy_retained = pick_truncation_rank(
         S, truncation_policy, truncation_rank, energy_threshold, lora_rank,
     )

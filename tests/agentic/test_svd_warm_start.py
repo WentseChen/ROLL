@@ -225,6 +225,37 @@ def test_key_naming_matches_deepspeed():
         ], f"unexpected keys: {keys}"
 
 
+# ---------- NaN/Inf guards ---------- #
+
+def test_nan_input_adapter_raises():
+    sd = _make_adapter_sd(seed=40)
+    sd["base_model.model.foo.lora_A.weight"][0, 0] = float("nan")
+    with pytest.raises(RuntimeError, match="non-finite"):
+        sws.build_meta_lora([sd], [1.0], compute_dtype="float32")
+
+
+def test_nan_W_meta_raises_in_svd():
+    W = torch.full((4, 8), float("inf"))
+    with pytest.raises(RuntimeError, match="non-finite"):
+        sws.svd_truncate_and_perturb(
+            W, lora_rank=4, truncation_policy="fixed", truncation_rank=2, energy_threshold=0.9,
+            shrink_factor=1.0, residual_noise_scope="none", perturbation_sigma=0.0,
+            generator=torch.Generator().manual_seed(0), output_dtype=torch.float32,
+        )
+
+
+def test_zero_W_meta_warns_no_crash(caplog):
+    W = torch.zeros(4, 8)
+    A_new, B_new, k, energy = sws.svd_truncate_and_perturb(
+        W, lora_rank=4, truncation_policy="fixed", truncation_rank=2, energy_threshold=0.9,
+        shrink_factor=1.0, residual_noise_scope="a_only", perturbation_sigma=0.01,
+        generator=torch.Generator().manual_seed(0), output_dtype=torch.float32,
+    )
+    assert torch.all(A_new[:k, :] == 0)  # sqrt(0)=0
+    assert torch.all(B_new[:, :k] == 0)
+    assert energy == 0.0
+
+
 # ---------- Seed reproducibility ---------- #
 
 def test_seed_reproducibility():
