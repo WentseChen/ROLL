@@ -235,10 +235,15 @@ def build_warm_start_state_dict(
         "n_modules": len(W_meta_map),
         "k_mean": float(np.mean(k_per_module)) if k_per_module else 0.0,
         "energy_retained_mean": float(np.mean(energy_per_module)) if energy_per_module else 0.0,
+        "energy_retained_min": float(np.min(energy_per_module)) if energy_per_module else 0.0,
+        "energy_retained_max": float(np.max(energy_per_module)) if energy_per_module else 0.0,
+        "energy_retained_std": float(np.std(energy_per_module)) if energy_per_module else 0.0,
     }
     logger.info(
         f"svd_warm_start: applied (n_population={meta['n_population']}, n_skipped={meta['n_skipped']}, "
         f"n_modules={meta['n_modules']}, k_mean={meta['k_mean']:.1f}, "
-        f"energy_retained_mean={meta['energy_retained_mean']:.4f})"
+        f"energy_retained mean={meta['energy_retained_mean']:.4f} "
+        f"min={meta['energy_retained_min']:.4f} max={meta['energy_retained_max']:.4f} "
+        f"std={meta['energy_retained_std']:.4f})"
     )
     return state_dict, meta
