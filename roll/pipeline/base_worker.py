@@ -330,6 +330,25 @@ class ActorWorker(Worker):
         return DataProto(meta_info={"metrics": metrics})
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def apply_lora_state_dict_warm_start(
+        self,
+        lora_state_dict: Dict,
+        num_training_steps: int,
+        missing_param_policy: str = "kaiming_zero",
+    ):
+        """SVD warm-start: load externally-computed LoRA tensors and reset optimizer/scheduler."""
+        with Timer("apply_lora_state_dict_warm_start") as total_timer:
+            exec_metrics: Dict = self.strategy.apply_lora_state_dict_warm_start(
+                lora_state_dict, num_training_steps, missing_param_policy
+            )
+        metrics = {
+            f"time/{self.cluster_name}/apply_lora_state_dict_warm_start/total": total_timer.last,
+        }
+        metric_prefix = f"time/{self.cluster_name}/apply_lora_state_dict_warm_start"
+        metrics.update({f"{metric_prefix}/{k}": v for k, v in exec_metrics.items()})
+        return DataProto(meta_info={"metrics": metrics})
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def do_checkpoint(self, global_step, is_last_step=None):
         if self.worker_config.offload_nccl:
             reload_process_groups()

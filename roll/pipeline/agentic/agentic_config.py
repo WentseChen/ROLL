@@ -238,6 +238,68 @@ class EnvMonitorConfig:
 
 
 @dataclass
+class SVDWarmStartConfig:
+    """Gates and parameterizes the SVD warm-start replacement of cold_start."""
+
+    enabled: bool = field(
+        default=False,
+        metadata={"help": "Replace cold_start reset with SVD-decomposed warm start over the Nash-weighted population."},
+    )
+    truncation_policy: Literal["fixed", "energy"] = field(
+        default="fixed",
+        metadata={"help": "'fixed' uses truncation_rank; 'energy' picks smallest k whose top-k captures energy_threshold of SV energy."},
+    )
+    truncation_rank: int = field(
+        default=8,
+        metadata={"help": "[fixed policy] Top-k singular components retained per LoRA module. Must be < lora_rank."},
+    )
+    energy_threshold: float = field(
+        default=0.9,
+        metadata={"help": "[energy policy] Fraction of singular-value energy to retain (0 < x < 1)."},
+    )
+    shrink_factor: float = field(
+        default=1.0,
+        metadata={"help": "Multiplier on top-k principal components. 1.0 = preserve exactly; <1 enables Shrink-and-Perturb."},
+    )
+    residual_noise_scope: Literal["a_only", "a_and_b", "none"] = field(
+        default="a_only",
+        metadata={"help": "Where to inject N(0, perturbation_sigma^2) noise into the residual (r-k) rank slice."},
+    )
+    perturbation_sigma: float = field(
+        default=1e-3,
+        metadata={"help": "Std of Gaussian noise injected into residual slice."},
+    )
+    min_population_size: int = field(
+        default=2,
+        metadata={"help": "Minimum FSP population size (including base) required to apply warm start."},
+    )
+    first_iteration_fallback: Literal["cold_start", "no_op", "raise"] = field(
+        default="cold_start",
+        metadata={"help": "Behavior when warm-start prerequisites are not yet met."},
+    )
+    missing_adapter_policy: Literal["skip", "raise"] = field(
+        default="skip",
+        metadata={"help": "'skip' renormalizes Nash over remaining adapters; 'raise' errors immediately."},
+    )
+    missing_param_policy: Literal["kaiming_zero", "raise"] = field(
+        default="kaiming_zero",
+        metadata={"help": "If a model LoRA param has no key in the warm-start state dict."},
+    )
+    adapter_load_timeout_s: int = field(
+        default=120,
+        metadata={"help": "Max wait (s) for an in-flight async-uploaded adapter_model.safetensors."},
+    )
+    compute_dtype: Literal["float32", "float64"] = field(
+        default="float32",
+        metadata={"help": "Dtype for meta-LoRA aggregation and SVD. Use float64 for numerical stability."},
+    )
+    seed_offset: int = field(
+        default=0,
+        metadata={"help": "Added to global_seed + global_step when drawing residual noise."},
+    )
+
+
+@dataclass
 class AgenticConfig(PPOConfig):
     # agentic related
     custom_envs: Dict[str, Any] = field(default_factory=dict, metadata={"help": "List of environment configurations."})
@@ -341,6 +403,11 @@ class AgenticConfig(PPOConfig):
     )
 
     ctde: CTDEConfig = field(default_factory=CTDEConfig, metadata={"help": "Centralized Training Decentralized Execution config."})
+
+    svd_warm_start: SVDWarmStartConfig = field(
+        default_factory=SVDWarmStartConfig,
+        metadata={"help": "SVD-empowered PSRO warm start config (gates and parameterizes the warm-start replacement of cold_start)."},
+    )
 
     parse_tool_call_parameter_to_dict: bool = field(default=False, metadata={"help": "Parse tool call parameter to dict. for https://github.com/QwenLM/Qwen3-Coder/issues/444"})
 
@@ -488,6 +555,25 @@ class AgenticConfig(PPOConfig):
 
         # Apply OPD configuration at the end (handles student_train/student_infer/teacher mapping)
         self._apply_opd_config()
+
+        if self.svd_warm_start.enabled:
+            svd = self.svd_warm_start
+            lora_rank = self.actor_train.model_args.lora_rank
+            if svd.truncation_policy == "fixed":
+                assert svd.truncation_rank < lora_rank, (
+                    f"svd_warm_start.truncation_rank ({svd.truncation_rank}) must be < lora_rank ({lora_rank})"
+                )
+            if svd.truncation_policy == "energy":
+                assert 0 < svd.energy_threshold < 1, (
+                    f"svd_warm_start.energy_threshold must be in (0, 1), got {svd.energy_threshold}"
+                )
+            assert 0 < svd.shrink_factor <= 1, (
+                f"svd_warm_start.shrink_factor must be in (0, 1], got {svd.shrink_factor}"
+            )
+            assert svd.perturbation_sigma >= 0, (
+                f"svd_warm_start.perturbation_sigma must be >= 0, got {svd.perturbation_sigma}"
+            )
+            assert self.cold_start, "svd_warm_start.enabled requires cold_start=true"
 
     def make_env_configs(self, env_manager_config: EnvManagerConfig):
         # construct env configs
