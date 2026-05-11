@@ -48,6 +48,7 @@ psro_mode: true
 psro_episodes_per_pair: 12   # 1 full cycle of 12 start states
 psro_max_concurrent_eval: 4
 psro_seed_base: 12345
+psro_bubble_eval_episodes: 0  # disabled in smoke test — avoids OOM from concurrent bg evals
 
 svd_warm_start:
   enabled: true
