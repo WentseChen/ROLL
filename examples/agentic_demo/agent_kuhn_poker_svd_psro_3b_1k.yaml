@@ -59,7 +59,7 @@ svd_warm_start:
   shrink_factor: 1.0
   residual_noise_scope: a_only
   perturbation_sigma: 0.001
-  min_population_size: 2
+  min_population_size: 4   # first 2 FSP iters use cold_start; warm-start starts at iter 3 (avoids self-play variance collapse on early deterministic BRs)
   first_iteration_fallback: cold_start
   missing_adapter_policy: skip
   missing_param_policy: kaiming_zero
