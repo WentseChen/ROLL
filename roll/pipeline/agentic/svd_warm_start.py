@@ -339,14 +339,19 @@ def _spectrum_module_metrics(
         Q_j = _build_row_basis(A_j.to(torch.float64))  # (d_in, r_j)
         if Q_j.shape[1] == 0:
             continue
-        # Principal angles via SVD of cross-Gram: svd(Q_meta^T @ Q_j) -> cos(theta_i)
+        # Principal angles via SVD of cross-Gram: svd(Q_meta^T @ Q_j) -> cos(theta_i).
+        # There are d_eff = min(k_eff, r_j) principal angles. When r_j > k_eff, the
+        # remaining (r_j - k_eff) directions of Q_j are orthogonal to Q_meta by
+        # construction and contribute sin^2 = 1 each to the Frobenius sin-norm.
+        # Hence: ||sin Theta||_F^2 (full) = r_j - sum(cos^2) — covers both r_j <= k
+        # and r_j > k uniformly. Normalize by r_j so pres in [0, 1]:
+        #   pres = 1 iff Q_j is entirely contained in Q_meta (all cos = 1);
+        #   pres = 0 iff Q_j is orthogonal to Q_meta (all cos = 0).
         M = Q_meta.T @ Q_j  # (k_eff, r_j)
         cos_vals = torch.linalg.svdvals(M).clamp(min=0.0, max=1.0)
-        d_eff = min(Q_meta.shape[1], Q_j.shape[1])
-        sin_sq_sum = float(d_eff - float((cos_vals[:d_eff] ** 2).sum()))
-        sin_sq_sum = max(sin_sq_sum, 0.0)  # numerical clamp
         r_j = int(Q_j.shape[1])
-        pres = 1.0 - (sin_sq_sum ** 0.5) / (max(r_j, 1) ** 0.5)
+        sin_sq_sum_full = max(0.0, float(r_j) - float((cos_vals ** 2).sum()))
+        pres = 1.0 - (sin_sq_sum_full / max(r_j, 1)) ** 0.5
         pres_per_member.append(max(0.0, min(1.0, pres)))
 
     subspace_pres_min = float(min(pres_per_member)) if pres_per_member else 1.0

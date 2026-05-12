@@ -337,8 +337,41 @@ def test_spectrum_subspace_pres_orthogonal_pop():
         Vh_top[i, i] = 1.0
     S = torch.tensor([1.0, 1.0, 1.0, 1.0])
     m = sws._spectrum_module_metrics(S, Vh_top, k=4, module_path="base_model.model.m", population_adapters=[sd_j])
-    # All sin θ = 1 → sin_sq_sum = r_j = 2 → pres = 1 - sqrt(2)/sqrt(2) = 0.
     assert m["subspace_pres_min"] == pytest.approx(0.0, abs=1e-5)
+
+
+def test_spectrum_subspace_pres_orthogonal_member_larger_than_k():
+    """Regression: r_j > k_eff orthogonal case. Earlier code dropped (r_j - k) silently-
+    orthogonal directions and gave pres ≈ 0.29 instead of 0."""
+    d_in = 32
+    # Member rank-8 (r_j) along axes 10..17 (orthogonal to meta).
+    A_j = torch.zeros(8, d_in)
+    for i in range(8):
+        A_j[i, 10 + i] = 1.0
+    sd_j = {"base_model.model.m.lora_A.weight": A_j, "base_model.model.m.lora_B.weight": torch.eye(8, 8)}
+    # Meta row-space = first 4 axes (k=4, r_j=8 → r_j > k).
+    Vh_top = torch.zeros(4, d_in)
+    for i in range(4):
+        Vh_top[i, i] = 1.0
+    S = torch.tensor([1.0, 1.0, 1.0, 1.0])
+    m = sws._spectrum_module_metrics(S, Vh_top, k=4, module_path="base_model.model.m", population_adapters=[sd_j])
+    assert m["subspace_pres_min"] == pytest.approx(0.0, abs=1e-5)
+
+
+def test_spectrum_subspace_pres_contained_member_smaller_than_k():
+    """Q_j ⊂ Q_meta (r_j < k). pres should be 1."""
+    d_in = 32
+    A_j = torch.zeros(4, d_in)
+    A_j[0, 0] = 1.0
+    A_j[1, 2] = 1.0  # member is rank-2 along axes 0, 2
+    sd_j = {"base_model.model.m.lora_A.weight": A_j, "base_model.model.m.lora_B.weight": torch.eye(8, 4)}
+    # Meta covers axes 0,1,2,3 (k=4 > r_j=2, member's rows live in meta)
+    Vh_top = torch.zeros(4, d_in)
+    for i in range(4):
+        Vh_top[i, i] = 1.0
+    S = torch.tensor([1.0, 1.0, 1.0, 1.0])
+    m = sws._spectrum_module_metrics(S, Vh_top, k=4, module_path="base_model.model.m", population_adapters=[sd_j])
+    assert m["subspace_pres_min"] == pytest.approx(1.0, abs=1e-5)
 
 
 def test_spectrum_metrics_integration_via_build_warm_start():
@@ -347,8 +380,7 @@ def test_spectrum_metrics_integration_via_build_warm_start():
     with tempfile.TemporaryDirectory() as a_dir, tempfile.TemporaryDirectory() as b_dir:
         _save_adapter_to_dir(sd1, a_dir)
         _save_adapter_to_dir(_make_adapter_sd(seed=51), b_dir)
-        cfg = _TestCfg(adapter_load_timeout_s=1)
-        cfg.log_spectrum_metrics = True  # opt in (duck-typed)
+        cfg = _TestCfg(adapter_load_timeout_s=1, log_spectrum_metrics=True)
         _state, meta = sws.build_warm_start_state_dict(
             lora_paths=[a_dir, b_dir], nash_probs=[0.5, 0.5], cfg=cfg,
             lora_rank=4, model_dtype=torch.float32, seed=0,
