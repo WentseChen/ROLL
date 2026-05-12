@@ -10,7 +10,7 @@ hydra:
     dir: .
   output_subdir: null
 
-exp_name: "kuhn_svd_psro_3b_1k"
+exp_name: "kuhn_svd_psro_3b_r4"
 seed: 42
 logging_dir: /zfsauton/scratch/wentsec/kuhn_poker_output/logs
 output_dir: /zfsauton/scratch/wentsec/kuhn_poker_output
@@ -27,9 +27,6 @@ tracker_kwargs:
     - svd_warm_start
     - async
     - auton
-    - ev_payoff
-    - gs24
-    - score0p15
 
 checkpoint_config:
   type: file_system
@@ -51,15 +48,21 @@ fsp_score_timeout: 150
 cold_start: true
 async_generation_ratio: 1
 
+# PSRO: expand payoff matrix + compute Nash after each FSP generation
+psro_mode: true
+psro_episodes_per_pair: 36   # 3 full cycles of 12 start states
+psro_seed_base: 12345
+psro_bubble_eval_episodes: 144   # 12 groups × 12 start states
+
 svd_warm_start:
   enabled: true
   truncation_policy: fixed
-  truncation_rank: 8           # r/4 with r=32
+  truncation_rank: 4           # r // 8 with r = 32
   energy_threshold: 0.9
   shrink_factor: 1.0
   residual_noise_scope: a_only
   perturbation_sigma: 0.001
-  min_population_size: 2
+  min_population_size: 3
   first_iteration_fallback: cold_start
   missing_adapter_policy: skip
   missing_param_policy: kaiming_zero
@@ -67,12 +70,6 @@ svd_warm_start:
   compute_dtype: float32
   seed_offset: 0
   log_spectrum_metrics: false
-
-# PSRO: expand payoff matrix + compute Nash after each FSP generation
-psro_mode: true
-psro_episodes_per_pair: 36   # 3 full cycles of 12 start states
-psro_seed_base: 12345
-psro_bubble_eval_episodes: 144   # 12 groups × 12 start states
 
 rollout_batch_size: 264  # 11 * 24
 val_batch_size: 8

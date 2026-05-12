@@ -63,6 +63,7 @@ svd_warm_start:
   adapter_load_timeout_s: 120
   compute_dtype: float32
   seed_offset: 0
+  log_spectrum_metrics: false
 
 # PSRO: expand payoff matrix + compute Nash after each FSP generation
 psro_mode: true
