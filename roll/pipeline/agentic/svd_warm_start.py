@@ -307,10 +307,11 @@ def _spectrum_module_metrics(
     H_post = -(p_top * torch.log(p_top.clamp(min=eps))).sum()
     r_eff_post = float(torch.exp(H_post))
 
-    # 3) Primary headline: r_eff_post relative to the achievable maximum
-    #    (capped at k_eff: you cannot have more effective rank than retained dims).
-    denom_ratio = max(min(float(k_eff), r_eff_pre), eps)
-    r_eff_ratio = r_eff_post / denom_ratio
+    # 3) Primary headline: fraction of effective rank preserved across truncation.
+    #    r_eff_post / r_eff_pre directly answers "how much of the original effective
+    #    spectrum survived?" Goes to 1.0 only if r_eff_pre <= k (no truncation
+    #    needed); otherwise drops proportionally to how much was discarded.
+    r_eff_ratio = r_eff_post / max(r_eff_pre, eps)
 
     # 4) Participation ratio (L2-energy weighted soft rank). Disagreement with
     #    r_eff_ratio reveals sigma_1 dominance / peakiness.

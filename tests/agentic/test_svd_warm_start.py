@@ -268,21 +268,36 @@ def test_zero_W_meta_warns_no_crash(monkeypatch):
 # ---------- Spectrum metrics (Roy-Vetterli r_eff, PR, log_vol, subspace_pres) ---------- #
 
 def test_spectrum_r_eff_uniform_equals_rank():
-    """Uniform spectrum (all sigmas equal) → r_eff_pre == rank."""
+    """Uniform spectrum (all sigmas equal) → r_eff_pre == rank.
+
+    With k<r_eff_pre, ratio = r_eff_post / r_eff_pre = 4/10 = 0.4 (fraction of
+    effective rank preserved, not internal utilization).
+    """
     S = torch.ones(10)
     Vh_top = torch.eye(10, 32)[:4]  # k=4
     m = sws._spectrum_module_metrics(S, Vh_top, k=4, module_path="m", population_adapters=[])
     assert m["r_eff_pre"] == pytest.approx(10.0, rel=1e-6)
     assert m["r_eff_post"] == pytest.approx(4.0, rel=1e-6)  # top-4 also uniform
+    assert m["r_eff_ratio"] == pytest.approx(0.4, rel=1e-6)
+
+
+def test_spectrum_r_eff_ratio_full_preservation_when_k_geq_pre():
+    """When k >= r_eff_pre, no truncation needed → r_eff_ratio = 1.0."""
+    S = torch.tensor([1.0, 1.0, 1.0, 1.0])  # uniform rank-4 spectrum
+    Vh_top = torch.eye(4, 16)
+    m = sws._spectrum_module_metrics(S, Vh_top, k=4, module_path="m", population_adapters=[])
+    assert m["r_eff_pre"] == pytest.approx(4.0, rel=1e-6)
+    assert m["r_eff_post"] == pytest.approx(4.0, rel=1e-6)
     assert m["r_eff_ratio"] == pytest.approx(1.0, rel=1e-6)
 
 
 def test_spectrum_r_eff_peaky_equals_one():
-    """sigma_1 dominates → r_eff ≈ 1."""
+    """sigma_1 dominates → r_eff_pre ≈ 1; truncation preserves it fully (ratio≈1)."""
     S = torch.tensor([100.0, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6])
     Vh_top = torch.eye(8, 16)[:4]
     m = sws._spectrum_module_metrics(S, Vh_top, k=4, module_path="m", population_adapters=[])
     assert m["r_eff_pre"] < 1.01  # essentially rank-1
+    assert m["r_eff_ratio"] == pytest.approx(1.0, abs=1e-2)  # nothing to lose
     assert m["pr_ratio"] == pytest.approx(1.0, abs=1e-3)
 
 
@@ -390,8 +405,11 @@ def test_spectrum_metrics_integration_via_build_warm_start():
             "spectrum/pr_ratio", "spectrum/log_vol", "spectrum/subspace_pres_min",
         ):
             assert key in meta, f"missing {key} in metadata"
-        # r_eff_ratio should be in [0, 1+eps]
+        # r_eff_ratio is fraction of effective rank preserved, in [0, 1+eps]
         assert 0.0 <= meta["spectrum/r_eff_ratio"] <= 1.05
+        # Truncation discards some effective rank (r_eff_pre > k or close to k);
+        # r_eff_post <= r_eff_pre by construction
+        assert meta["spectrum/r_eff_post"] <= meta["spectrum/r_eff_pre"] + 1e-6
         # subspace_pres_min should be in [0, 1]
         assert 0.0 <= meta["spectrum/subspace_pres_min"] <= 1.0
 
