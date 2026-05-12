@@ -150,7 +150,7 @@ def pick_truncation_rank(
     return k, retained
 
 
-def svd_truncate_and_perturb(
+def _truncate_with_aux(
     W_meta: torch.Tensor,
     lora_rank: int,
     truncation_policy: str,
@@ -161,19 +161,15 @@ def svd_truncate_and_perturb(
     perturbation_sigma: float,
     generator: Optional[torch.Generator],
     output_dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor, int, float]:
-    """Per-module SVD + Phase-3 refactorization.
-
-    Returns (A_new, B_new, k, energy_retained) where
-        A_new: (lora_rank, d_in)
-        B_new: (d_out, lora_rank)
-    """
+) -> tuple[torch.Tensor, torch.Tensor, int, float, torch.Tensor, torch.Tensor]:
+    """Internal: same as svd_truncate_and_perturb, but also returns full S and top-k Vh
+    (needed for spectrum metrics)."""
     d_out, d_in = W_meta.shape
     if not torch.isfinite(W_meta).all():
-        raise RuntimeError("svd_warm_start.svd_truncate_and_perturb: non-finite W_meta.")
+        raise RuntimeError("svd_warm_start._truncate_with_aux: non-finite W_meta.")
     U, S, Vh = torch.linalg.svd(W_meta, full_matrices=False)  # U:(d_out,p), S:(p,), Vh:(p,d_in)
     if not (torch.isfinite(S).all() and torch.isfinite(U).all() and torch.isfinite(Vh).all()):
-        raise RuntimeError("svd_warm_start.svd_truncate_and_perturb: SVD produced non-finite outputs.")
+        raise RuntimeError("svd_warm_start._truncate_with_aux: SVD produced non-finite outputs.")
     if float(S.sum().item()) == 0.0:
         logger.warning(
             f"svd_warm_start: zero-energy spectrum for module of shape {tuple(W_meta.shape)}; "
@@ -204,7 +200,165 @@ def svd_truncate_and_perturb(
         if residual_noise_scope == "a_and_b":
             B_new[:, k:] = torch.randn(residual_shape_b, generator=generator, dtype=W_meta.dtype) * perturbation_sigma
 
-    return A_new.to(output_dtype), B_new.to(output_dtype), k, energy_retained
+    return A_new.to(output_dtype), B_new.to(output_dtype), k, energy_retained, S, Vh[:k, :]
+
+
+def svd_truncate_and_perturb(
+    W_meta: torch.Tensor,
+    lora_rank: int,
+    truncation_policy: str,
+    truncation_rank: int,
+    energy_threshold: float,
+    shrink_factor: float,
+    residual_noise_scope: str,
+    perturbation_sigma: float,
+    generator: Optional[torch.Generator],
+    output_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, int, float]:
+    """Per-module SVD + Phase-3 refactorization.
+
+    Returns (A_new, B_new, k, energy_retained) where
+        A_new: (lora_rank, d_in)
+        B_new: (d_out, lora_rank)
+    """
+    A_new, B_new, k, energy_retained, _S, _Vh_top = _truncate_with_aux(
+        W_meta, lora_rank, truncation_policy, truncation_rank, energy_threshold,
+        shrink_factor, residual_noise_scope, perturbation_sigma, generator, output_dtype,
+    )
+    return A_new, B_new, k, energy_retained
+
+
+# ---------- Spectrum metrics (literature-grounded "volume of information preserved") ----------
+#
+# These supplement energy_retained, which is dominated by sigma_1 and hides whether
+# truncation kept enough effective rank / population-direction diversity. References:
+#   - Roy & Vetterli (2007), "The effective rank: A measure of effective dimensionality"
+#   - Davis-Kahan / Wedin sin-Theta theorems
+#   - Participation ratio from Anderson localization / Goldt et al. neural net dim
+
+
+def _build_row_basis(A: torch.Tensor, rtol: float = 1e-6) -> torch.Tensor:
+    """Orthonormal basis of row(A) as a (d_in, r_eff) matrix.
+
+    A has shape (r, d_in); rows are not assumed orthonormal. The row-space is
+    spanned by right singular vectors with non-zero singular values.
+    Returns an empty (d_in, 0) tensor when A has no significant content.
+    """
+    if A.numel() == 0:
+        return A.new_zeros((A.shape[-1], 0))
+    _U, S, Vh = torch.linalg.svd(A, full_matrices=False)
+    if S.numel() == 0:
+        return A.new_zeros((A.shape[-1], 0))
+    s_max = float(S[0].item())
+    if s_max == 0.0:
+        return A.new_zeros((A.shape[-1], 0))
+    tol = rtol * s_max
+    r_eff = int((S > tol).sum().item())
+    return Vh[:r_eff, :].T  # (d_in, r_eff)
+
+
+def _spectrum_module_metrics(
+    S_full: torch.Tensor,
+    Vh_top: torch.Tensor,
+    k: int,
+    module_path: str,
+    population_adapters: list[Optional[dict]],
+) -> dict[str, float]:
+    """Six "volume of information preserved" scalars for one module.
+
+    See module-level docstring for the metric set and citations.
+
+    Args:
+        S_full: full singular spectrum of W_meta, shape (p,).
+        Vh_top: top-k right singular vectors of W_meta, shape (k, d_in).
+        k: truncation rank actually used.
+        module_path: LoRA module key (for fetching per-member A_j).
+        population_adapters: list of state_dicts (or None for base placeholder).
+
+    Returns:
+        Dict with keys:
+          r_eff_pre, r_eff_post, r_eff_ratio, pr_ratio, log_vol, subspace_pres_min
+    """
+    eps = 1e-12
+    sv = S_full.to(torch.float64).clamp(min=0.0)
+    sv_pos = sv[sv > eps]
+    if sv_pos.numel() == 0:
+        # Degenerate: zero-energy meta-LoRA. Conventional defaults so downstream
+        # aggregation doesn't NaN out.
+        return {
+            "r_eff_pre": 0.0,
+            "r_eff_post": 0.0,
+            "r_eff_ratio": 0.0,
+            "pr_ratio": 0.0,
+            "log_vol": 0.0,
+            "subspace_pres_min": 1.0,
+        }
+
+    k_eff = min(int(k), int(sv_pos.numel()))
+
+    # 1) Effective rank (Roy-Vetterli) on the full pre-truncation spectrum.
+    p_full = sv_pos / sv_pos.sum()
+    H_pre = -(p_full * torch.log(p_full.clamp(min=eps))).sum()
+    r_eff_pre = float(torch.exp(H_pre))
+
+    # 2) Effective rank on the post-truncation kept top-k.
+    sv_top = sv_pos[:k_eff]
+    p_top = sv_top / sv_top.sum().clamp(min=eps)
+    H_post = -(p_top * torch.log(p_top.clamp(min=eps))).sum()
+    r_eff_post = float(torch.exp(H_post))
+
+    # 3) Primary headline: r_eff_post relative to the achievable maximum
+    #    (capped at k_eff: you cannot have more effective rank than retained dims).
+    denom_ratio = max(min(float(k_eff), r_eff_pre), eps)
+    r_eff_ratio = r_eff_post / denom_ratio
+
+    # 4) Participation ratio (L2-energy weighted soft rank). Disagreement with
+    #    r_eff_ratio reveals sigma_1 dominance / peakiness.
+    e_full = sv_pos.pow(2)
+    e_top = sv_top.pow(2)
+    pr_full = float((e_full.sum() ** 2) / e_full.pow(2).sum().clamp(min=eps))
+    pr_top = float((e_top.sum() ** 2) / e_top.pow(2).sum().clamp(min=eps))
+    pr_ratio = pr_top / max(pr_full, eps)
+
+    # 5) Log-volume on kept dims. Catches multiplicative collapse (any sigma_i -> 0).
+    log_vol = float(torch.log(sv_top.clamp(min=eps)).sum())
+
+    # 6) Subspace preservation per population member (Davis-Kahan principal angles).
+    #    For each loaded adapter j, compare row(top_k(W_meta)) to row(A_j).
+    Q_meta = Vh_top.to(torch.float64).T  # (d_in, k_eff_basis); columns orthonormal
+    # Truncate to k_eff columns to match the actual non-zero subspace dim.
+    Q_meta = Q_meta[:, :k_eff] if Q_meta.shape[1] > k_eff else Q_meta
+    pres_per_member: list[float] = []
+    for sd in population_adapters:
+        if sd is None:
+            continue  # base placeholder contributes Delta W = 0; no row-space
+        pairs = group_lora_pairs_by_module(sd)
+        if module_path not in pairs:
+            continue
+        A_j, _B_j = pairs[module_path]
+        Q_j = _build_row_basis(A_j.to(torch.float64))  # (d_in, r_j)
+        if Q_j.shape[1] == 0:
+            continue
+        # Principal angles via SVD of cross-Gram: svd(Q_meta^T @ Q_j) -> cos(theta_i)
+        M = Q_meta.T @ Q_j  # (k_eff, r_j)
+        cos_vals = torch.linalg.svdvals(M).clamp(min=0.0, max=1.0)
+        d_eff = min(Q_meta.shape[1], Q_j.shape[1])
+        sin_sq_sum = float(d_eff - float((cos_vals[:d_eff] ** 2).sum()))
+        sin_sq_sum = max(sin_sq_sum, 0.0)  # numerical clamp
+        r_j = int(Q_j.shape[1])
+        pres = 1.0 - (sin_sq_sum ** 0.5) / (max(r_j, 1) ** 0.5)
+        pres_per_member.append(max(0.0, min(1.0, pres)))
+
+    subspace_pres_min = float(min(pres_per_member)) if pres_per_member else 1.0
+
+    return {
+        "r_eff_pre": r_eff_pre,
+        "r_eff_post": r_eff_post,
+        "r_eff_ratio": r_eff_ratio,
+        "pr_ratio": pr_ratio,
+        "log_vol": log_vol,
+        "subspace_pres_min": subspace_pres_min,
+    }
 
 
 def _renormalize(probs: list[float], keep_mask: list[bool]) -> list[float]:
@@ -271,22 +425,51 @@ def build_warm_start_state_dict(
     generator = torch.Generator(device="cpu")
     generator.manual_seed(int(seed))
 
+    log_spectrum = bool(getattr(cfg, "log_spectrum_metrics", False))
+    spectrum_metric_keys = (
+        "r_eff_pre", "r_eff_post", "r_eff_ratio", "pr_ratio", "log_vol", "subspace_pres_min",
+    )
+
     state_dict: dict[str, torch.Tensor] = {}
     k_values: list[int] = []
     energies: list[float] = []
+    spectrum_per_module: dict[str, list[float]] = {k: [] for k in spectrum_metric_keys}
     for module, W in W_meta.items():
-        A_new, B_new, k, energy_retained = svd_truncate_and_perturb(
-            W,
-            lora_rank=lora_rank,
-            truncation_policy=cfg.truncation_policy,
-            truncation_rank=cfg.truncation_rank,
-            energy_threshold=cfg.energy_threshold,
-            shrink_factor=cfg.shrink_factor,
-            residual_noise_scope=cfg.residual_noise_scope,
-            perturbation_sigma=cfg.perturbation_sigma,
-            generator=generator,
-            output_dtype=model_dtype,
-        )
+        if log_spectrum:
+            A_new, B_new, k, energy_retained, S_full, Vh_top = _truncate_with_aux(
+                W,
+                lora_rank=lora_rank,
+                truncation_policy=cfg.truncation_policy,
+                truncation_rank=cfg.truncation_rank,
+                energy_threshold=cfg.energy_threshold,
+                shrink_factor=cfg.shrink_factor,
+                residual_noise_scope=cfg.residual_noise_scope,
+                perturbation_sigma=cfg.perturbation_sigma,
+                generator=generator,
+                output_dtype=model_dtype,
+            )
+            module_metrics = _spectrum_module_metrics(
+                S_full=S_full,
+                Vh_top=Vh_top,
+                k=k,
+                module_path=module,
+                population_adapters=adapters,
+            )
+            for mk in spectrum_metric_keys:
+                spectrum_per_module[mk].append(module_metrics[mk])
+        else:
+            A_new, B_new, k, energy_retained = svd_truncate_and_perturb(
+                W,
+                lora_rank=lora_rank,
+                truncation_policy=cfg.truncation_policy,
+                truncation_rank=cfg.truncation_rank,
+                energy_threshold=cfg.energy_threshold,
+                shrink_factor=cfg.shrink_factor,
+                residual_noise_scope=cfg.residual_noise_scope,
+                perturbation_sigma=cfg.perturbation_sigma,
+                generator=generator,
+                output_dtype=model_dtype,
+            )
         a_key, b_key = _to_in_model_keys(module)
         state_dict[a_key] = A_new
         state_dict[b_key] = B_new
@@ -308,4 +491,12 @@ def build_warm_start_state_dict(
         "energy_retained_min": float(e_arr.min()),
         "energy_retained_max": float(e_arr.max()),
     }
+    if log_spectrum:
+        for mk in spectrum_metric_keys:
+            arr = np.asarray(spectrum_per_module[mk], dtype=np.float64)
+            if arr.size == 0:
+                continue
+            metadata[f"spectrum/{mk}/mean"] = float(arr.mean())
+            metadata[f"spectrum/{mk}/min"] = float(arr.min())
+            metadata[f"spectrum/{mk}/max"] = float(arr.max())
     return state_dict, metadata

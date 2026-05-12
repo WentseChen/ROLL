@@ -33,6 +33,7 @@ class _TestCfg:
     adapter_load_timeout_s: int = 5
     compute_dtype: Literal["float32", "float64"] = "float32"
     seed_offset: int = 0
+    log_spectrum_metrics: bool = False
 
 
 def _make_adapter_sd(d_in=16, d_out=8, r=4, scale=1.0, seed=0):
@@ -262,6 +263,105 @@ def test_zero_W_meta_warns_no_crash(monkeypatch):
     assert torch.all(B_new[:, :k] == 0)
     assert energy == 0.0
     assert any("zero-energy" in m for m in seen), f"expected zero-energy warning, got: {seen!r}"
+
+
+# ---------- Spectrum metrics (Roy-Vetterli r_eff, PR, log_vol, subspace_pres) ---------- #
+
+def test_spectrum_r_eff_uniform_equals_rank():
+    """Uniform spectrum (all sigmas equal) → r_eff_pre == rank."""
+    S = torch.ones(10)
+    Vh_top = torch.eye(10, 32)[:4]  # k=4
+    m = sws._spectrum_module_metrics(S, Vh_top, k=4, module_path="m", population_adapters=[])
+    assert m["r_eff_pre"] == pytest.approx(10.0, rel=1e-6)
+    assert m["r_eff_post"] == pytest.approx(4.0, rel=1e-6)  # top-4 also uniform
+    assert m["r_eff_ratio"] == pytest.approx(1.0, rel=1e-6)
+
+
+def test_spectrum_r_eff_peaky_equals_one():
+    """sigma_1 dominates → r_eff ≈ 1."""
+    S = torch.tensor([100.0, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6])
+    Vh_top = torch.eye(8, 16)[:4]
+    m = sws._spectrum_module_metrics(S, Vh_top, k=4, module_path="m", population_adapters=[])
+    assert m["r_eff_pre"] < 1.01  # essentially rank-1
+    assert m["pr_ratio"] == pytest.approx(1.0, abs=1e-3)
+
+
+def test_spectrum_pr_uniform_equals_rank():
+    """Uniform spectrum → PR == rank (energy-weighted soft rank)."""
+    S = torch.ones(6)
+    Vh_top = torch.eye(6, 16)[:3]
+    m = sws._spectrum_module_metrics(S, Vh_top, k=3, module_path="m", population_adapters=[])
+    # PR_full = (6)^2 / 6 = 6; PR_top = (3)^2 / 3 = 3; ratio = 0.5
+    assert m["pr_ratio"] == pytest.approx(0.5, rel=1e-6)
+
+
+def test_spectrum_log_vol_detects_collapse():
+    """One sigma -> 0 makes log_vol diverge negatively, even if others are large."""
+    S_healthy = torch.tensor([1.0, 1.0, 1.0, 1.0])
+    Vh_top = torch.eye(4, 16)[:4]
+    m_healthy = sws._spectrum_module_metrics(S_healthy, Vh_top, k=4, module_path="m", population_adapters=[])
+    S_collapsed = torch.tensor([1.0, 1.0, 1.0, 1e-10])
+    m_collapsed = sws._spectrum_module_metrics(S_collapsed, Vh_top, k=4, module_path="m", population_adapters=[])
+    assert m_healthy["log_vol"] == pytest.approx(0.0, abs=1e-6)
+    assert m_collapsed["log_vol"] < -20.0  # log(1e-10) = -23
+
+
+def test_spectrum_subspace_pres_identity_pop():
+    """When meta-LoRA row-space exactly contains a population member's row-space, pres=1."""
+    d_in = 32
+    # Member j has rank-2 row-space along axes 0 and 1.
+    A_j = torch.zeros(4, d_in)
+    A_j[0, 0] = 1.0
+    A_j[1, 1] = 1.0
+    sd_j = {"base_model.model.m.lora_A.weight": A_j, "base_model.model.m.lora_B.weight": torch.eye(8, 4)}
+    # Meta row-space = first 4 axes (includes the member's first 2).
+    Vh_top = torch.zeros(4, d_in)
+    for i in range(4):
+        Vh_top[i, i] = 1.0
+    S = torch.tensor([1.0, 1.0, 1.0, 1.0])
+    m = sws._spectrum_module_metrics(S, Vh_top, k=4, module_path="base_model.model.m", population_adapters=[sd_j])
+    assert m["subspace_pres_min"] == pytest.approx(1.0, abs=1e-5)
+
+
+def test_spectrum_subspace_pres_orthogonal_pop():
+    """When meta and member row-spaces are orthogonal, pres=0."""
+    d_in = 32
+    # Member rank-2 along axes 10, 11.
+    A_j = torch.zeros(4, d_in)
+    A_j[0, 10] = 1.0
+    A_j[1, 11] = 1.0
+    sd_j = {"base_model.model.m.lora_A.weight": A_j, "base_model.model.m.lora_B.weight": torch.eye(8, 4)}
+    # Meta row-space = first 4 axes (orthogonal to member).
+    Vh_top = torch.zeros(4, d_in)
+    for i in range(4):
+        Vh_top[i, i] = 1.0
+    S = torch.tensor([1.0, 1.0, 1.0, 1.0])
+    m = sws._spectrum_module_metrics(S, Vh_top, k=4, module_path="base_model.model.m", population_adapters=[sd_j])
+    # All sin θ = 1 → sin_sq_sum = r_j = 2 → pres = 1 - sqrt(2)/sqrt(2) = 0.
+    assert m["subspace_pres_min"] == pytest.approx(0.0, abs=1e-5)
+
+
+def test_spectrum_metrics_integration_via_build_warm_start():
+    """End-to-end: log_spectrum_metrics=True surfaces spectrum/* keys in metadata."""
+    sd1 = _make_adapter_sd(seed=50)
+    with tempfile.TemporaryDirectory() as a_dir, tempfile.TemporaryDirectory() as b_dir:
+        _save_adapter_to_dir(sd1, a_dir)
+        _save_adapter_to_dir(_make_adapter_sd(seed=51), b_dir)
+        cfg = _TestCfg(adapter_load_timeout_s=1)
+        cfg.log_spectrum_metrics = True  # opt in (duck-typed)
+        _state, meta = sws.build_warm_start_state_dict(
+            lora_paths=[a_dir, b_dir], nash_probs=[0.5, 0.5], cfg=cfg,
+            lora_rank=4, model_dtype=torch.float32, seed=0,
+        )
+        for key in (
+            "spectrum/r_eff_pre/mean", "spectrum/r_eff_post/mean", "spectrum/r_eff_ratio/mean",
+            "spectrum/pr_ratio/mean", "spectrum/log_vol/mean", "spectrum/subspace_pres_min/mean",
+        ):
+            assert key in meta, f"missing {key} in metadata"
+        # r_eff_ratio should be in [0, 1+eps]
+        assert 0.0 <= meta["spectrum/r_eff_ratio/mean"] <= 1.05
+        # subspace_pres_min should be in [0, 1]
+        assert 0.0 <= meta["spectrum/subspace_pres_min/min"] <= 1.0
 
 
 # ---------- Seed reproducibility ---------- #

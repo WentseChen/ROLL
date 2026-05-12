@@ -150,6 +150,10 @@ class CTDEConfig:
     )
     bonus_weight: float = field(default=0.1, metadata={"help": "Scale for reward_bonus signal."})
     kl_coef: float = field(default=0.1, metadata={"help": "Scale for kl_distill loss term."})
+    log_ratio_clip: float = field(
+        default=5.0,
+        metadata={"help": "Per-token log_ratio clip magnitude; 0 disables. Bounds teacher-student gap before scaling."},
+    )
     global_state_prefix: str = field(
         default="\n\n[Global context - training only]:",
         metadata={"help": "Text separator prepended to global state context."},
@@ -304,6 +308,10 @@ class SVDWarmStartConfig:
     seed_offset: int = field(
         default=0,
         metadata={"help": "Added to global seed + global_step when drawing residual noise. Bump to vary realization without changing global seed."},
+    )
+    log_spectrum_metrics: bool = field(
+        default=False,
+        metadata={"help": "Compute and log per-module spectrum metrics (r_eff, PR, subspace_pres, log_vol) at each warm-start. Opt-in: adds an extra small SVD per population member per module."},
     )
 
 
