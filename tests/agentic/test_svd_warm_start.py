@@ -386,14 +386,14 @@ def test_spectrum_metrics_integration_via_build_warm_start():
             lora_rank=4, model_dtype=torch.float32, seed=0,
         )
         for key in (
-            "spectrum/r_eff_pre/mean", "spectrum/r_eff_post/mean", "spectrum/r_eff_ratio/mean",
-            "spectrum/pr_ratio/mean", "spectrum/log_vol/mean", "spectrum/subspace_pres_min/mean",
+            "spectrum/r_eff_pre", "spectrum/r_eff_post", "spectrum/r_eff_ratio",
+            "spectrum/pr_ratio", "spectrum/log_vol", "spectrum/subspace_pres_min",
         ):
             assert key in meta, f"missing {key} in metadata"
         # r_eff_ratio should be in [0, 1+eps]
-        assert 0.0 <= meta["spectrum/r_eff_ratio/mean"] <= 1.05
+        assert 0.0 <= meta["spectrum/r_eff_ratio"] <= 1.05
         # subspace_pres_min should be in [0, 1]
-        assert 0.0 <= meta["spectrum/subspace_pres_min/min"] <= 1.0
+        assert 0.0 <= meta["spectrum/subspace_pres_min"] <= 1.0
 
 
 # ---------- Seed reproducibility ---------- #

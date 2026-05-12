@@ -501,7 +501,5 @@ def build_warm_start_state_dict(
             arr = np.asarray(spectrum_per_module[mk], dtype=np.float64)
             if arr.size == 0:
                 continue
-            metadata[f"spectrum/{mk}/mean"] = float(arr.mean())
-            metadata[f"spectrum/{mk}/min"] = float(arr.min())
-            metadata[f"spectrum/{mk}/max"] = float(arr.max())
+            metadata[f"spectrum/{mk}"] = float(arr.mean())
     return state_dict, metadata
