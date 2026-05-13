@@ -828,10 +828,18 @@ class AgenticPipeline(BasePipeline):
                             _generation_steps = max(1, self.pipeline_config.max_steps - global_step)
 
                         svd_cfg = self.pipeline_config.svd_warm_start
+                        # warm_start_every: warm-start fires at PSRO iters 1, 1+N, 1+2N, ...
+                        # Other iters fall through to cold_start (LoRA reset).
+                        _psro_iter = self._psro_loop._iteration if self._psro_loop is not None else 0
+                        is_warm_start_iter = (
+                            svd_cfg.warm_start_every <= 1
+                            or (_psro_iter >= 1 and (_psro_iter - 1) % svd_cfg.warm_start_every == 0)
+                        )
                         use_warm_start = (
                             svd_cfg.enabled
                             and self._latest_nash_probs is not None
                             and len(self.fsp_checkpoints) >= svd_cfg.min_population_size
+                            and is_warm_start_iter
                         )
 
                         if use_warm_start:
@@ -868,28 +876,42 @@ class AgenticPipeline(BasePipeline):
                                 f"n_skipped={int(meta['n_adapters_skipped'])})"
                             )
                         else:
-                            fallback = svd_cfg.first_iteration_fallback if svd_cfg.enabled else "cold_start"
+                            # Scheduled-skip iters (prereqs met but warm_start_every gate) always
+                            # force cold_start — first_iteration_fallback only applies to true
+                            # prereq misses (population too small / no Nash probs yet).
+                            prereqs_met = (
+                                svd_cfg.enabled
+                                and self._latest_nash_probs is not None
+                                and len(self.fsp_checkpoints) >= svd_cfg.min_population_size
+                            )
+                            if prereqs_met and not is_warm_start_iter:
+                                fallback = "cold_start"
+                                skip_reason = (
+                                    f"scheduled cold_start (psro_iter={_psro_iter}, "
+                                    f"warm_start_every={svd_cfg.warm_start_every})"
+                                )
+                            else:
+                                fallback = svd_cfg.first_iteration_fallback if svd_cfg.enabled else "cold_start"
+                                skip_reason = (
+                                    f"prereqs not met (population={len(self.fsp_checkpoints)} < "
+                                    f"min_population_size={svd_cfg.min_population_size} or no Nash probs)"
+                                )
                             if fallback == "cold_start":
                                 logger.info(
                                     f"FSP cold_start: resetting training LoRA weights at step {global_step} "
-                                    f"(next generation = {_generation_steps} steps)"
+                                    f"({skip_reason}, next generation = {_generation_steps} steps)"
                                 )
                                 self.actor_train.reset_lora_weights(_generation_steps, blocking=True)
                                 if self.pipeline_config.async_pipeline:
                                     self._pending_fsp_flush = True
                             elif fallback == "no_op":
                                 logger.info(
-                                    f"FSP svd_warm_start: prereqs not met "
-                                    f"(population={len(self.fsp_checkpoints)} < "
-                                    f"min_population_size={svd_cfg.min_population_size}); "
+                                    f"FSP svd_warm_start: {skip_reason}; "
                                     f"first_iteration_fallback=no_op, keeping current LoRA weights."
                                 )
                             elif fallback == "raise":
                                 raise RuntimeError(
-                                    "svd_warm_start enabled but prereqs not met "
-                                    f"(population={len(self.fsp_checkpoints)} < "
-                                    f"min_population_size={svd_cfg.min_population_size} "
-                                    f"or no Nash probs)."
+                                    f"svd_warm_start enabled but {skip_reason}."
                                 )
 
                 with Timer(name="log", logger=None) as log_timer:

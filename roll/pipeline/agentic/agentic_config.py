@@ -313,6 +313,10 @@ class SVDWarmStartConfig:
         default=False,
         metadata={"help": "Compute and log per-module spectrum metrics (r_eff, PR, subspace_pres, log_vol) at each warm-start. Opt-in: adds an extra small SVD per population member per module."},
     )
+    warm_start_every: int = field(
+        default=1,
+        metadata={"help": "Apply warm-start once every N PSRO iters; cold_start (LoRA reset) on the others. 1 = warm-start every iter (original behavior). With N>1, warm-start fires at iter 1, 1+N, 1+2N, ..."},
+    )
 
 
 @dataclass
@@ -599,6 +603,7 @@ class AgenticConfig(PPOConfig):
         assert cfg.perturbation_sigma >= 0, f"svd_warm_start.perturbation_sigma ({cfg.perturbation_sigma}) must be >= 0."
         assert cfg.min_population_size >= 2, f"svd_warm_start.min_population_size ({cfg.min_population_size}) must be >= 2."
         assert cfg.adapter_load_timeout_s > 0, f"svd_warm_start.adapter_load_timeout_s ({cfg.adapter_load_timeout_s}) must be > 0."
+        assert cfg.warm_start_every >= 1, f"svd_warm_start.warm_start_every ({cfg.warm_start_every}) must be >= 1."
 
     def make_env_configs(self, env_manager_config: EnvManagerConfig):
         # construct env configs
