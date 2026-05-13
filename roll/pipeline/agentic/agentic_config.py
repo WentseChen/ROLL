@@ -317,6 +317,10 @@ class SVDWarmStartConfig:
         default=1,
         metadata={"help": "Apply warm-start once every N PSRO iters; cold_start (LoRA reset) on the others. 1 = warm-start every iter (original behavior). With N>1, warm-start fires at iter 1, 1+N, 1+2N, ..."},
     )
+    nash_temperature: float = field(
+        default=1.0,
+        metadata={"help": "Tempered Nash weighting for W_meta: pi_tilde_i = pi_i^alpha / sum_j pi_j^alpha, with alpha=nash_temperature. <1 flattens Nash (preserves diversity); 1.0 = vanilla Nash (default); >1 sharpens. Only affects W_meta aggregation, not enemy-pool sampling."},
+    )
 
 
 @dataclass
@@ -604,6 +608,7 @@ class AgenticConfig(PPOConfig):
         assert cfg.min_population_size >= 2, f"svd_warm_start.min_population_size ({cfg.min_population_size}) must be >= 2."
         assert cfg.adapter_load_timeout_s > 0, f"svd_warm_start.adapter_load_timeout_s ({cfg.adapter_load_timeout_s}) must be > 0."
         assert cfg.warm_start_every >= 1, f"svd_warm_start.warm_start_every ({cfg.warm_start_every}) must be >= 1."
+        assert cfg.nash_temperature > 0, f"svd_warm_start.nash_temperature ({cfg.nash_temperature}) must be > 0."
 
     def make_env_configs(self, env_manager_config: EnvManagerConfig):
         # construct env configs

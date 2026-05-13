@@ -375,6 +375,21 @@ def _renormalize(probs: list[float], keep_mask: list[bool]) -> list[float]:
     return [p / total if m else 0.0 for p, m in zip(probs, keep_mask)]
 
 
+def _temper_probs(probs: list[float], alpha: float) -> list[float]:
+    """Tempered Nash: pi_tilde_i = pi_i^alpha / sum_j pi_j^alpha.
+
+    alpha < 1 flattens (diversity-preserving); alpha = 1 is identity; alpha > 1
+    sharpens toward argmax. Zero entries stay zero (0**alpha = 0 for alpha > 0).
+    """
+    if alpha == 1.0:
+        return probs
+    powered = [max(float(p), 0.0) ** alpha for p in probs]
+    total = sum(powered)
+    if total <= 0:
+        raise RuntimeError(f"nash_temperature={alpha}: tempered weights sum to 0 (all-zero Nash?).")
+    return [p / total for p in powered]
+
+
 def _to_in_model_keys(module_path: str) -> tuple[str, str]:
     """Re-insert .default. infix for in-model named_parameters() lookup."""
     return (
@@ -424,7 +439,12 @@ def build_warm_start_state_dict(
 
     effective_probs = _renormalize(nash_probs, keep_mask) if n_skipped > 0 else nash_probs
 
-    W_meta = build_meta_lora(adapters, effective_probs, compute_dtype=cfg.compute_dtype)
+    # Tempered Nash for W_meta only (enemy-pool sampling keeps vanilla Nash).
+    # alpha<1 flattens; raises peakiness penalty so minor-policy directions survive truncation.
+    alpha = float(getattr(cfg, "nash_temperature", 1.0))
+    tempered_probs = _temper_probs(effective_probs, alpha) if alpha != 1.0 else effective_probs
+
+    W_meta = build_meta_lora(adapters, tempered_probs, compute_dtype=cfg.compute_dtype)
     if not W_meta:
         raise RuntimeError("svd_warm_start: build_meta_lora produced no modules (all adapters skipped or empty).")
 
@@ -496,6 +516,9 @@ def build_warm_start_state_dict(
         "energy_retained_mean": float(e_arr.mean()),
         "energy_retained_min": float(e_arr.min()),
         "energy_retained_max": float(e_arr.max()),
+        "nash_alpha": float(alpha),
+        "nash_tempered_max": float(max(tempered_probs)) if tempered_probs else 0.0,
+        "nash_tempered_min_nz": float(min((p for p in tempered_probs if p > 0), default=0.0)),
     }
     if log_spectrum:
         for mk in spectrum_metric_keys:
