@@ -43,6 +43,7 @@ class KuhnPokerEnv(Env):
     def __init__(
         self,
         max_steps: int = 2,
+        num_hands: int = 2,
         format_penalty: float = 0.0,
         reasoning_reward: float = 0.0,
         action_pattern: str = r"<answer>(.*?)</answer>",
@@ -54,6 +55,7 @@ class KuhnPokerEnv(Env):
         **kwargs,
     ):
         self.max_steps = max_steps
+        self.num_hands = num_hands
         self.format_penalty = format_penalty
         self.reasoning_reward = reasoning_reward
         self.action_pattern = action_pattern
