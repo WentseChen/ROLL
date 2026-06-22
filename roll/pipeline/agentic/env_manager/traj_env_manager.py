@@ -306,7 +306,9 @@ class TrajEnvManager(BaseEnvManager):
         }, batch_size=input_ids.shape[0])
         content["prompt_ids"] = prompt_ids
         content["messages"] = messages
+        print(lm_input)
         return lm_input
+    
 
     def formulate_rollouts(self, rollout_cache: RolloutCache):
         """
