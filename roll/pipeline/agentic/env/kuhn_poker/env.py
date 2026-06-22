@@ -43,6 +43,8 @@ class KuhnPokerEnv(Env):
     def __init__(
         self,
         max_steps: int = 2,
+        num_hands: int = 2, # Should work for any given nubmer of hands
+        # print output of format messages
         format_penalty: float = 0.0,
         reasoning_reward: float = 0.0,
         action_pattern: str = r"<answer>(.*?)</answer>",
@@ -54,6 +56,7 @@ class KuhnPokerEnv(Env):
         **kwargs,
     ):
         self.max_steps = max_steps
+        self.num_hands = num_hands
         self.format_penalty = format_penalty
         self.reasoning_reward = reasoning_reward
         self.action_pattern = action_pattern
@@ -116,10 +119,13 @@ class KuhnPokerEnv(Env):
 
         self.rng = random.Random()
         self._init_game_state()
-
-    def _init_game_state(self):
-        self.cards: dict[int, int] = {}  # player_idx -> card_value (0=J, 1=Q, 2=K)
-        self.agent_is_p0: bool = True
+    
+    def _init_trajectory_state(self): # Resets across-hand state
+        self.hand_count: int = 0 # Stores how many hands have been completed
+        self.cumulative_reward: float = 0.0
+        self.hand_history: list = []
+        
+    def _init_hand_state(self): # Resets per-hand state
         self.game_state: str = self.P0_ACTING
         self.p0_action: Optional[str] = None
         self.p1_action: Optional[str] = None
@@ -131,6 +137,67 @@ class KuhnPokerEnv(Env):
         self._last_action_probs: dict = {}
         self._last_action_taken: Optional[str] = None
         self._opponent_action_at_think: Optional[str] = None
+        
+        
+        # testing
+    # def _init_game_state(self):
+    #     self.cards: dict[int, int] = {}  # player_idx -> card_value (0=J, 1=Q, 2=K)
+    #     self.agent_is_p0: bool = True
+    #     self.game_state: str = self.P0_ACTING
+    #     self.p0_action: Optional[str] = None
+    #     self.p1_action: Optional[str] = None
+    #     self.p0_response: Optional[str] = None
+    #     self.final_reward: float = 0.0
+    #     self.step_count: int = 0
+    #     self.wins: int = 0
+    #     self._last_think: str = ""
+    #     self._last_action_probs: dict = {}
+    #     self._last_action_taken: Optional[str] = None
+    #     self._opponent_action_at_think: Optional[str] = None
+    
+    # The singular _init_game_state method reset everything at once. However, in a multi-hand trajectory, we don't want to reset _everything_ between hands, some things need to persist, like the history of past hands, while other things need to be wiped, like whose turn it is.
+    # So, we need to split state into two buckets, while letting _init_game_state still exist for convenience (used in tests and at startup). It just calls both, which resets everything.
+    
+    def _init_game_state(self):
+        self._init_trajectory_state()
+        self.agent_is_p0: bool = True
+        self._init_hand_state()
+    
+    def _end_hand(self, reward: float, is_valid: bool, action_info: dict, agg: dict, desc: str):
+        # This is called when a hand finishes. Delivers rewards, records history, starts next hand or terminates.
+        self.hand_count += 1
+        self.cumulative_reward += reward
+        # To give the model context of the hand, record a summary of it.
+        agent_card = CARD_NAMES[self.cards[0 if self.agent_is_p0 else 1]]
+        role = "P1" if self.agent_is_p0 else "P2"
+        self.hand_history.append(
+            f"Hand {self.hand_count}: You held {agent_card} as {role}. {desc} Reward: {reward:+.0f}"
+        )
+
+        info = self._make_info(is_valid, agg, desc)
+        info.update(action_info)
+        info["metrics"]["hand_num"] = self.hand_count
+        info["metrics"]["cumulative_reward"] = self.cumulative_reward
+        info["metrics_agg_mode"]["hand_num"] = "last"
+        info["metrics_agg_mode"]["cumulative_reward"] = "last"
+
+        if self.hand_count < self.num_hands:
+            # Flip seats and start the next hand
+            self.agent_is_p0 = not self.agent_is_p0
+            deck = [0, 1, 2]
+            self.rng.shuffle(deck)
+            self.cards = {0: deck[0], 1: deck[1]}
+            self._init_hand_state()
+            # Return first observation of next hand
+            if self.agent_is_p0:
+                obs = self._render_p0_first_action()
+                info["opponent_first"] = False
+            else:
+                obs = self._render_p0_first_action()
+                info["opponent_first"] = True
+            return obs, reward, False, False, info
+        else:
+            return "", reward, True, False, info
 
     def get_instructions(self) -> str:
         action_str = "\nYour available actions are:\n" + ", ".join(self.ACTION_LOOKUP.values())
@@ -154,14 +221,14 @@ class KuhnPokerEnv(Env):
 
     def reset(self, seed: Optional[int] = None):
         Env.reset(self, seed)
-        self._init_game_state()
+        # self._init_game_state() # Initially, this just wiped everything in one call
+        self._init_trajectory_state() # Wipes only trajectory state
 
-        if self.debug_mode and seed is not None:
-            # Cycle deterministically through all 12 start states
+        if self.debug_mode and seed is not None: # Cycle deterministically through all 12 start states
+            self.rng = random.Random(seed)
             state = self._ALL_STATES[seed % self.NUM_START_STATES]
             self.cards = {0: state[0], 1: state[1]}
             self.agent_is_p0 = state[2]
-            self.rng = random.Random(seed)
         else:
             self.rng = random.Random(seed)
             # Deal cards: sample 2 from {0,1,2} without replacement
@@ -170,7 +237,9 @@ class KuhnPokerEnv(Env):
             self.cards = {0: deck[0], 1: deck[1]}  # poker-P0, poker-P1
             # Randomly assign agent position
             self.agent_is_p0 = self.rng.choice([True, False])
-
+        
+        self._init_hand_state() # Wipes only hand state
+        
         info = {"env_instruction": self.get_instructions()}
 
         if self.agent_is_p0:
@@ -235,7 +304,7 @@ class KuhnPokerEnv(Env):
         length_bonus = self.reasoning_reward * (len(action) / 4000)  # 4000 chars ≈ 1000 tokens ≈ 1 good-pattern unit
         reward += length_bonus
         info["metrics"]["reasoning/length_bonus"] = length_bonus
-        return obs, reward, terminated, truncated, info
+        return obs, reward, terminated, truncated, info #**
 
     def _handle_p0_acting(self, action_name: str, is_valid: bool, action_info: dict, agg: dict):
         """Poker-P0's first action: Pass or Bet."""
@@ -302,7 +371,8 @@ class KuhnPokerEnv(Env):
                 f"{winner} wins! Reward: {self.final_reward:+.0f}")
         info = self._make_info(is_valid, agg, desc)
         info.update(action_info)
-        return "", self.final_reward, True, False, info
+        # return "", self.final_reward, True, False, info
+        return self._end_hand(self.final_reward, is_valid, action_info, agg, desc) # Delegates to end_hand
 
     def _resolve_fold(self, folder: int, is_valid: bool, action_info: dict, agg: dict):
         """Resolve by fold. The non-folding player wins the pot."""
@@ -321,7 +391,8 @@ class KuhnPokerEnv(Env):
         desc = f"{folder_name} folds. Reward: {self.final_reward:+.0f}"
         info = self._make_info(is_valid, agg, desc)
         info.update(action_info)
-        return "", self.final_reward, True, False, info
+        # return "", self.final_reward, True, False, info
+        return self._end_hand(self.final_reward, is_valid, action_info, agg, desc) # Delegates to end_hand
 
     # Nash prescribes a deterministic action (P=0 or P=1) at these info-sets.
     # Mixed info-sets (J_P1_open, Q_P1_vs_bet, J_P2_vs_pass, Q_P2_vs_bet) are excluded.
@@ -584,14 +655,20 @@ class KuhnPokerEnv(Env):
         return out
 
     # --- Observation rendering ---
+    def _render_history_prefix(self) -> str:
+        if not self.hand_history: # If the list is empty
+            return "" # Return an empty string, meaning nothing gets prepended to the observation
+        history = "\n".join(self.hand_history) # self.hand_history is a list of strings, one per completed hand.
+        return f"=== Match History ===\n{history}\n=====================\n\n"
 
     def _render_p0_first_action(self) -> str:
         """Observation for poker-P0's first action."""
         card = CARD_NAMES[self.cards[0]]
         strength = CARD_STRENGTH[self.cards[0]]
-        return (f"Your card: {card} ({strength} card). You are Player 1 (first to act).\n"
+        body = (f"Your card: {card} ({strength} card). You are Player 1 (first to act).\n"
                 f"Pot size: 2 chips (both antes). Board state: no action yet.\n"
                 f"Choose: Pass or Bet.")
+        return self._render_history_prefix() + body
 
     def _render_p1_action(self) -> str:
         """Observation for poker-P1 after P0's action."""
@@ -603,19 +680,21 @@ class KuhnPokerEnv(Env):
             f"Pot odds: {pot}:{call_cost} (call {call_cost} to win {pot})."
             if call_cost else "No bet to call."
         )
-        return (f"Your card: {card} ({strength} card). You are Player 2.\n"
+        body = (f"Your card: {card} ({strength} card). You are Player 2.\n"
                 f"Pot size: {pot} chips. Board state: Player 1 chose {self.p0_action}.\n"
                 f"{pot_odds_str}\n"
                 f"Choose: Pass or Bet.")
+        return self._render_history_prefix() + body
 
     def _render_p0_response(self) -> str:
         """Observation for poker-P0 responding to P1's bet."""
         card = CARD_NAMES[self.cards[0]]
         strength = CARD_STRENGTH[self.cards[0]]
-        return (f"Your card: {card} ({strength} card). You are Player 1.\n"
+        body = (f"Your card: {card} ({strength} card). You are Player 1.\n"
                 f"Pot size: 3 chips. Board state: you passed, Player 2 bet.\n"
                 f"Pot odds: 3:1 (call 1 to win 3).\n"
                 f"Choose: Pass (fold) or Bet (call).")
+        return self._render_history_prefix() + body
 
     def render(self, mode: str = "text") -> str:
         if self.game_state == self.P0_ACTING:

@@ -675,7 +675,8 @@ class RolloutScheduler(RolloutMockMixin):
         # start env manager
         if self.rollout_task is None:
             seed = random.randint(0, 1000000) if self.mode == "train" else self.config.seed
-            self.rollout_task = asyncio.create_task(self._run_rollout_loop(seed))
+            # tells all the environment workers to start running their game in the background with the same seed as all the environment workers in that episode slot.
+            self.rollout_task = asyncio.create_task(self._run_rollout_loop(seed)) # same seed
 
         await asyncio.gather(*self.es_manager.update_step(global_step, blocking=False))
         await self.env_output_queue.advance_step.remote(global_step)
